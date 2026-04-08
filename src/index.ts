@@ -201,10 +201,17 @@ const TOOLS = [
   },
 ];
 
-// --- Shared helpers ---
-
 function textResult(text: string) {
   return { content: [{ type: "text", text }] };
+}
+
+function clampImportance(v?: number): number {
+  return Math.min(Math.max(v || 0, 0), 10);
+}
+
+function validateHall(hall?: string): string {
+  if (hall && !(HALLS as readonly string[]).includes(hall)) return "facts";
+  return hall || "facts";
 }
 
 function formatMemory(r: any, extra?: string): string {
@@ -222,26 +229,35 @@ function formatMemory(r: any, extra?: string): string {
   return text;
 }
 
-// Resolve wing/room names to IDs, auto-creating if needed
+function formatMemoryResults(results: any[], header?: string): string {
+  if (!results.length) return "No memories found.";
+  const body = results.map((r) => formatMemory(r)).join("\n\n---\n\n");
+  return header ? `${header}\n\n${body}` : body;
+}
+
 async function resolveWingRoom(
   env: Env,
   wingName?: string,
   roomName?: string,
   wingType?: string,
-): Promise<{ wingId: string | null; roomId: string | null }> {
-  if (!wingName) return { wingId: null, roomId: null };
+  description?: string,
+): Promise<{ wingId: string | null; roomId: string | null; created: boolean }> {
+  if (!wingName) return { wingId: null, roomId: null, created: false };
 
+  let created = false;
   let wing = (await env.DB.prepare("SELECT id FROM wings WHERE name = ?")
     .bind(wingName).first()) as any;
   if (!wing) {
     const wingId = crypto.randomUUID();
+    const wType = (WING_TYPES as readonly string[]).includes(wingType || "") ? wingType : "project";
     await env.DB.prepare(
-      "INSERT INTO wings (id, name, type, created_at) VALUES (?, ?, ?, ?)",
-    ).bind(wingId, wingName, wingType || "project", new Date().toISOString()).run();
+      "INSERT INTO wings (id, name, type, description, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).bind(wingId, wingName, wType, description || null, new Date().toISOString()).run();
     wing = { id: wingId };
+    created = true;
   }
 
-  if (!roomName) return { wingId: wing.id, roomId: null };
+  if (!roomName) return { wingId: wing.id, roomId: null, created };
 
   let room = (await env.DB.prepare(
     "SELECT id FROM rooms WHERE wing_id = ? AND name = ?",
@@ -249,39 +265,34 @@ async function resolveWingRoom(
   if (!room) {
     const roomId = crypto.randomUUID();
     await env.DB.prepare(
-      "INSERT INTO rooms (id, wing_id, name, created_at) VALUES (?, ?, ?, ?)",
-    ).bind(roomId, wing.id, roomName, new Date().toISOString()).run();
+      "INSERT INTO rooms (id, wing_id, name, description, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).bind(roomId, wing.id, roomName, description || null, new Date().toISOString()).run();
     room = { id: roomId };
+    created = true;
   }
 
-  return { wingId: wing.id, roomId: room.id };
+  return { wingId: wing.id, roomId: room.id, created };
 }
 
-// Build SELECT with LEFT JOINs for wing/room names
 const MEMORY_SELECT = `SELECT m.*, w.name as wing_name, r.name as room_name
   FROM memories m
   LEFT JOIN wings w ON m.wing_id = w.id
   LEFT JOIN rooms r ON m.room_id = r.id`;
 
-async function resolveWingRoomFilters(
-  env: Env,
-  wingName?: string,
-  roomName?: string,
-): Promise<{ wingId?: string; roomId?: string }> {
-  const result: { wingId?: string; roomId?: string } = {};
-  if (wingName) {
-    const wing = (await env.DB.prepare("SELECT id FROM wings WHERE name = ?")
-      .bind(wingName).first()) as any;
-    if (wing) result.wingId = wing.id;
-    else return { wingId: "NOTFOUND" };
-  }
-  if (roomName && result.wingId) {
-    const room = (await env.DB.prepare("SELECT id FROM rooms WHERE wing_id = ? AND name = ?")
-      .bind(result.wingId, roomName).first()) as any;
-    if (room) result.roomId = room.id;
-    else return { wingId: result.wingId, roomId: "NOTFOUND" };
-  }
-  return result;
+async function deleteEntity(env: Env, table: string, where: string, bind: string) {
+  const result = await env.DB.prepare(`DELETE FROM ${table} WHERE ${where}`).bind(bind).run();
+  const label = table.replace(/s$/, "");
+  return result.meta.changes ? textResult(`Deleted ${label}.`) : textResult(`${label} not found.`);
+}
+
+function addPalaceFilters(
+  conditions: string[],
+  binds: unknown[],
+  args: { wing?: string; room?: string; hall?: string },
+) {
+  if (args.wing) { conditions.push("w.name = ?"); binds.push(args.wing); }
+  if (args.room) { conditions.push("r.name = ?"); binds.push(args.room); }
+  if (args.hall) { conditions.push("m.hall = ?"); binds.push(args.hall); }
 }
 
 function createSseStream(
@@ -673,14 +684,17 @@ async function memoryStore(
     content: string; category?: string; tags?: string[];
     wing?: string; wing_type?: string; room?: string;
     hall?: string; importance?: number;
+    _isCloset?: boolean; _sourceIds?: string[];
   },
   env: Env,
 ) {
   const id = crypto.randomUUID();
-  const category = args.category || "general";
+  const category = args._isCloset ? "reference" : (args.category || "general");
   const tags = JSON.stringify(args.tags || []);
-  const hall = args.hall || "facts";
-  const importance = Math.min(Math.max(args.importance || 0, 0), 10);
+  const hall = validateHall(args.hall);
+  const importance = args._isCloset ? clampImportance(args.importance || 5) : clampImportance(args.importance);
+  const isCloset = args._isCloset ? 1 : 0;
+  const sourceIds = JSON.stringify(args._sourceIds || []);
   const now = new Date().toISOString();
 
   const [embedding, { wingId, roomId }] = await Promise.all([
@@ -689,9 +703,9 @@ async function memoryStore(
   ]);
 
   await env.DB.prepare(
-    "INSERT INTO memories (id, content, category, tags, wing_id, room_id, hall, importance, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO memories (id, content, category, tags, wing_id, room_id, hall, is_closet, source_ids, importance, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   )
-    .bind(id, args.content, category, tags, wingId, roomId, hall, importance, now, now)
+    .bind(id, args.content, category, tags, wingId, roomId, hall, isCloset, sourceIds, importance, now, now)
     .run();
 
   await env.VECTORIZE.upsert([
@@ -699,7 +713,8 @@ async function memoryStore(
   ]);
 
   const location = [args.wing, args.room].filter(Boolean).join("/");
-  return textResult(`Stored memory [${id}] in ${category}/${hall}${location ? ` 📍${location}` : ""}${importance > 0 ? ` (importance: ${importance})` : ""}`);
+  const label = args._isCloset ? "closet" : "memory";
+  return textResult(`Stored ${label} [${id}] in ${category}/${hall}${location ? ` 📍${location}` : ""}${importance > 0 ? ` (importance: ${importance})` : ""}`);
 }
 
 async function memorySearch(
@@ -724,12 +739,10 @@ async function memorySearch(
 
   let query = `${MEMORY_SELECT} WHERE m.id IN (${placeholders})`;
   const binds: unknown[] = [...ids];
+  const conditions: string[] = [];
 
-  // Post-filter by palace location and hall
-  const filters = await resolveWingRoomFilters(env, args.wing, args.room);
-  if (filters.wingId) { query += " AND m.wing_id = ?"; binds.push(filters.wingId); }
-  if (filters.roomId) { query += " AND m.room_id = ?"; binds.push(filters.roomId); }
-  if (args.hall) { query += " AND m.hall = ?"; binds.push(args.hall); }
+  addPalaceFilters(conditions, binds, args);
+  if (conditions.length) query += " AND " + conditions.join(" AND ");
 
   const { results } = await env.DB.prepare(query).bind(...binds).all();
 
@@ -758,22 +771,14 @@ async function memoryList(
 
   if (args.category) { conditions.push("m.category = ?"); binds.push(args.category); }
   if (args.tag) { conditions.push("m.tags LIKE ?"); binds.push(`%"${args.tag}"%`); }
-  if (args.hall) { conditions.push("m.hall = ?"); binds.push(args.hall); }
-
-  const filters = await resolveWingRoomFilters(env, args.wing, args.room);
-  if (filters.wingId) { conditions.push("m.wing_id = ?"); binds.push(filters.wingId); }
-  if (filters.roomId) { conditions.push("m.room_id = ?"); binds.push(filters.roomId); }
+  addPalaceFilters(conditions, binds, args);
 
   if (conditions.length) query += " WHERE " + conditions.join(" AND ");
   query += " ORDER BY m.importance DESC, m.created_at DESC LIMIT ? OFFSET ?";
   binds.push(limit, offset);
 
   const { results } = await env.DB.prepare(query).bind(...binds).all();
-
-  if (!(results as any[]).length) return textResult("No memories found.");
-
-  const text = (results as any[]).map((r) => formatMemory(r)).join("\n\n---\n\n");
-  return textResult(text);
+  return textResult(formatMemoryResults(results as any[]));
 }
 
 async function memoryGet(args: { id: string }, env: Env) {
@@ -807,8 +812,8 @@ async function memoryUpdate(
   const content = args.content || existing.content;
   const category = args.category || existing.category;
   const tags = args.tags ? JSON.stringify(args.tags) : existing.tags;
-  const hall = args.hall || existing.hall || "facts";
-  const importance = args.importance !== undefined ? Math.min(Math.max(args.importance, 0), 10) : (existing.importance || 0);
+  const hall = validateHall(args.hall || existing.hall);
+  const importance = args.importance !== undefined ? clampImportance(args.importance) : (existing.importance || 0);
   const now = new Date().toISOString();
 
   const { wingId, roomId } = await resolveWingRoom(env, args.wing, args.room);
@@ -850,34 +855,44 @@ async function memoryDelete(args: { id: string }, env: Env) {
 // --- Palace tools ---
 
 async function palaceOverview(env: Env) {
-  const wings = (await env.DB.prepare(
-    "SELECT w.*, (SELECT COUNT(*) FROM memories WHERE wing_id = w.id) as mem_count FROM wings w ORDER BY w.name",
-  ).all()).results as any[];
+  const [wingsRes, roomsRes, tunnelsRes, unorganized, hallCountsRes] = await Promise.all([
+    env.DB.prepare(
+      "SELECT w.*, (SELECT COUNT(*) FROM memories WHERE wing_id = w.id) as mem_count FROM wings w ORDER BY w.name",
+    ).all(),
+    env.DB.prepare(
+      "SELECT r.*, w.name as wing_name, (SELECT COUNT(*) FROM memories WHERE room_id = r.id) as mem_count FROM rooms r JOIN wings w ON r.wing_id = w.id ORDER BY w.name, r.name",
+    ).all(),
+    env.DB.prepare(
+      `SELECT t.id, t.description, ra.name as room_a, wa.name as wing_a, rb.name as room_b, wb.name as wing_b
+       FROM tunnels t
+       JOIN rooms ra ON t.room_a_id = ra.id JOIN wings wa ON ra.wing_id = wa.id
+       JOIN rooms rb ON t.room_b_id = rb.id JOIN wings wb ON rb.wing_id = wb.id`,
+    ).all(),
+    env.DB.prepare(
+      "SELECT COUNT(*) as cnt FROM memories WHERE wing_id IS NULL",
+    ).first() as Promise<any>,
+    env.DB.prepare(
+      "SELECT wing_id, room_id, hall, COUNT(*) as cnt FROM memories WHERE wing_id IS NOT NULL GROUP BY wing_id, room_id, hall",
+    ).all(),
+  ]);
 
-  const rooms = (await env.DB.prepare(
-    "SELECT r.*, w.name as wing_name, (SELECT COUNT(*) FROM memories WHERE room_id = r.id) as mem_count FROM rooms r JOIN wings w ON r.wing_id = w.id ORDER BY w.name, r.name",
-  ).all()).results as any[];
-
-  const tunnels = (await env.DB.prepare(
-    `SELECT t.id, t.description, ra.name as room_a, wa.name as wing_a, rb.name as room_b, wb.name as wing_b
-     FROM tunnels t
-     JOIN rooms ra ON t.room_a_id = ra.id JOIN wings wa ON ra.wing_id = wa.id
-     JOIN rooms rb ON t.room_b_id = rb.id JOIN wings wb ON rb.wing_id = wb.id`,
-  ).all()).results as any[];
-
-  const unorganized = (await env.DB.prepare(
-    "SELECT COUNT(*) as cnt FROM memories WHERE wing_id IS NULL",
-  ).first()) as any;
-
-  const hallCounts = (await env.DB.prepare(
-    "SELECT wing_id, room_id, hall, COUNT(*) as cnt FROM memories WHERE wing_id IS NOT NULL GROUP BY wing_id, room_id, hall",
-  ).all()).results as any[];
+  const wings = wingsRes.results as any[];
+  const rooms = roomsRes.results as any[];
+  const tunnels = tunnelsRes.results as any[];
+  const hallCounts = hallCountsRes.results as any[];
 
   const hallMap = new Map<string, Map<string, number>>();
   for (const h of hallCounts) {
     const key = h.room_id || h.wing_id;
     if (!hallMap.has(key)) hallMap.set(key, new Map());
     hallMap.get(key)!.set(h.hall || "facts", h.cnt);
+  }
+
+  const roomsByWing = new Map<string, any[]>();
+  for (const room of rooms) {
+    const list = roomsByWing.get(room.wing_name) || [];
+    list.push(room);
+    roomsByWing.set(room.wing_name, list);
   }
 
   let text = "# Memory Palace\n\n";
@@ -888,7 +903,7 @@ async function palaceOverview(env: Env) {
     text += `## 🏛️ ${wing.name} (${wing.type}) — ${wing.mem_count} memories\n`;
     if (wing.description) text += `  ${wing.description}\n`;
 
-    const wingRooms = rooms.filter((r) => r.wing_name === wing.name);
+    const wingRooms = roomsByWing.get(wing.name) || [];
     if (wingRooms.length) {
       for (const room of wingRooms) {
         text += `  ### 🚪 ${room.name} — ${room.mem_count} memories\n`;
@@ -960,10 +975,11 @@ async function palaceManage(
       if (!args.room_a || !args.room_b) return textResult("Error: room_a and room_b required (format: 'wing/room').");
       const [wingA, roomA] = args.room_a.split("/");
       const [wingB, roomB] = args.room_b.split("/");
-      const rA = (await env.DB.prepare("SELECT r.id FROM rooms r JOIN wings w ON r.wing_id = w.id WHERE w.name = ? AND r.name = ?")
-        .bind(wingA, roomA).first()) as any;
-      const rB = (await env.DB.prepare("SELECT r.id FROM rooms r JOIN wings w ON r.wing_id = w.id WHERE w.name = ? AND r.name = ?")
-        .bind(wingB, roomB).first()) as any;
+      const roomQuery = "SELECT r.id FROM rooms r JOIN wings w ON r.wing_id = w.id WHERE w.name = ? AND r.name = ?";
+      const [rA, rB] = await Promise.all([
+        env.DB.prepare(roomQuery).bind(wingA, roomA).first() as Promise<any>,
+        env.DB.prepare(roomQuery).bind(wingB, roomB).first() as Promise<any>,
+      ]);
       if (!rA || !rB) return textResult("Error: one or both rooms not found.");
       const id = crypto.randomUUID();
       await env.DB.prepare("INSERT INTO tunnels (id, room_a_id, room_b_id, description, created_at) VALUES (?, ?, ?, ?, ?)")
@@ -971,22 +987,16 @@ async function palaceManage(
       return textResult(`Created tunnel: ${args.room_a} ↔ ${args.room_b} [${id}]`);
     }
     case "delete_wing": {
-      if (!args.id && !args.wing) return textResult("Error: wing id or name required.");
-      const where = args.id ? "id = ?" : "name = ?";
-      const bind = args.id || args.wing!;
-      const result = await env.DB.prepare(`DELETE FROM wings WHERE ${where}`).bind(bind).run();
-      return result.meta.changes ? textResult(`Deleted wing.`) : textResult("Wing not found.");
+      const where = args.id ? "id = ?" : args.wing ? "name = ?" : null;
+      if (!where) return textResult("Error: wing id or name required.");
+      return deleteEntity(env, "wings", where, (args.id || args.wing)!);
     }
-    case "delete_room": {
+    case "delete_room":
       if (!args.id) return textResult("Error: room id required.");
-      const result = await env.DB.prepare("DELETE FROM rooms WHERE id = ?").bind(args.id).run();
-      return result.meta.changes ? textResult(`Deleted room.`) : textResult("Room not found.");
-    }
-    case "delete_tunnel": {
+      return deleteEntity(env, "rooms", "id = ?", args.id);
+    case "delete_tunnel":
       if (!args.id) return textResult("Error: tunnel id required.");
-      const result = await env.DB.prepare("DELETE FROM tunnels WHERE id = ?").bind(args.id).run();
-      return result.meta.changes ? textResult(`Deleted tunnel.`) : textResult("Tunnel not found.");
-    }
+      return deleteEntity(env, "tunnels", "id = ?", args.id);
     default:
       return textResult(`Unknown action: ${args.action}`);
   }
@@ -999,49 +1009,32 @@ async function closetCreate(
   },
   env: Env,
 ) {
-  const id = crypto.randomUUID();
-  const tags = JSON.stringify(args.tags || []);
-  const hall = args.hall || "facts";
-  const sourceIds = JSON.stringify(args.source_ids);
-  const now = new Date().toISOString();
-
-  const [embedding, { wingId, roomId }] = await Promise.all([
-    embed(args.content, env),
-    resolveWingRoom(env, args.wing, args.room),
-  ]);
-
-  await env.DB.prepare(
-    "INSERT INTO memories (id, content, category, tags, wing_id, room_id, hall, is_closet, source_ids, importance, created_at, updated_at) VALUES (?, ?, 'reference', ?, ?, ?, ?, 1, ?, 5, ?, ?)",
-  ).bind(id, args.content, tags, wingId, roomId, hall, sourceIds, now, now).run();
-
-  await env.VECTORIZE.upsert([{ id, values: embedding, metadata: { category: "reference" } }]);
-
-  return textResult(`Created closet [${id}] summarizing ${args.source_ids.length} memories`);
+  return memoryStore(
+    {
+      content: args.content,
+      tags: args.tags,
+      wing: args.wing,
+      room: args.room,
+      hall: args.hall,
+      _isCloset: true,
+      _sourceIds: args.source_ids,
+    },
+    env,
+  );
 }
 
 async function wakeupContext(args: { limit?: number }, env: Env) {
   const limit = Math.min(args.limit || 10, 30);
 
+  // Single query: important first, then recent as fallback
   const { results } = await env.DB.prepare(
-    `${MEMORY_SELECT} WHERE m.importance > 0 ORDER BY m.importance DESC, m.updated_at DESC LIMIT ?`,
+    `${MEMORY_SELECT} ORDER BY m.importance DESC, m.updated_at DESC LIMIT ?`,
   ).bind(limit).all();
 
-  if (!(results as any[]).length) {
-    // Fallback: most recent memories
-    const fallback = await env.DB.prepare(
-      `${MEMORY_SELECT} ORDER BY m.updated_at DESC LIMIT ?`,
-    ).bind(limit).all();
-
-    if (!(fallback.results as any[]).length) return textResult("No memories yet.");
-
-    const text = "# Wake-up Context (recent, no importance set)\n\n" +
-      (fallback.results as any[]).map((r) => formatMemory(r)).join("\n\n---\n\n");
-    return textResult(text);
-  }
-
-  const text = "# Wake-up Context\n\n" +
-    (results as any[]).map((r) => formatMemory(r)).join("\n\n---\n\n");
-  return textResult(text);
+  const rows = results as any[];
+  const hasImportant = rows.some((r) => r.importance > 0);
+  const header = hasImportant ? "# Wake-up Context" : "# Wake-up Context (recent, no importance set)";
+  return textResult(formatMemoryResults(rows, header));
 }
 
 // --- Tool dispatcher ---
