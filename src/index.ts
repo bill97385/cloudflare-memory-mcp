@@ -20,7 +20,9 @@ interface JsonRpcResponse {
   error?: { code: number; message: string };
 }
 
-const SERVER_INFO = { name: "memory-mcp-server", version: "1.0.0" };
+const SERVER_INFO = { name: "memory-mcp-server", version: "2.0.0" };
+const HALLS = ["facts", "events", "discoveries", "preferences", "advice"] as const;
+const WING_TYPES = ["person", "project"] as const;
 const ACCESS_TOKEN_TTL_S = 30 * 24 * 60 * 60;
 const REFRESH_TOKEN_TTL_S = 90 * 24 * 60 * 60;
 const SSE_KEEPALIVE_MS = 15000;
@@ -43,7 +45,7 @@ const TOOLS = [
   {
     name: "memory_store",
     description:
-      "Store a new memory. Use this to save important information, user preferences, project context, decisions, or anything that should persist across conversations.",
+      "Store a new memory in the palace. Optionally place it in a wing (person/project), room (topic), and hall (memory type). Wings and rooms are auto-created if they don't exist.",
     inputSchema: {
       type: "object",
       properties: {
@@ -58,6 +60,15 @@ const TOOLS = [
           items: { type: "string" },
           description: "Tags for organizing and filtering",
         },
+        wing: { type: "string", description: "Wing name (person or project). Auto-created if new." },
+        wing_type: { type: "string", description: "Wing type (only needed when creating new wing)", enum: ["person", "project"] },
+        room: { type: "string", description: "Room name (topic within wing). Auto-created if new. Requires wing." },
+        hall: {
+          type: "string",
+          description: "Hall type: facts (decisions), events (milestones), discoveries (insights), preferences (habits), advice (recommendations)",
+          enum: ["facts", "events", "discoveries", "preferences", "advice"],
+        },
+        importance: { type: "number", description: "Importance 0-10 for wake-up context priority (default 0)" },
       },
       required: ["content"],
     },
@@ -65,12 +76,15 @@ const TOOLS = [
   {
     name: "memory_search",
     description:
-      "Search memories by semantic similarity. Returns the most relevant memories matching the query meaning.",
+      "Search memories by semantic similarity. Can filter by wing, room, hall, or category.",
     inputSchema: {
       type: "object",
       properties: {
         query: { type: "string", description: "Semantic search query" },
         category: { type: "string", description: "Filter by category" },
+        wing: { type: "string", description: "Filter by wing name" },
+        room: { type: "string", description: "Filter by room name" },
+        hall: { type: "string", description: "Filter by hall type" },
         limit: { type: "number", description: "Max results (default 10)" },
       },
       required: ["query"],
@@ -78,12 +92,15 @@ const TOOLS = [
   },
   {
     name: "memory_list",
-    description: "List all memories, optionally filtered by category or tag.",
+    description: "List memories with optional filters for category, tag, wing, room, or hall.",
     inputSchema: {
       type: "object",
       properties: {
         category: { type: "string", description: "Filter by category" },
         tag: { type: "string", description: "Filter by tag" },
+        wing: { type: "string", description: "Filter by wing name" },
+        room: { type: "string", description: "Filter by room name" },
+        hall: { type: "string", description: "Filter by hall type" },
         limit: { type: "number", description: "Max results (default 20)" },
         offset: { type: "number", description: "Pagination offset" },
       },
@@ -102,18 +119,18 @@ const TOOLS = [
   },
   {
     name: "memory_update",
-    description: "Update an existing memory by ID.",
+    description: "Update an existing memory. Can change content, category, tags, palace location, hall, or importance.",
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string", description: "Memory ID to update" },
         content: { type: "string", description: "New content" },
         category: { type: "string", description: "New category" },
-        tags: {
-          type: "array",
-          items: { type: "string" },
-          description: "New tags",
-        },
+        tags: { type: "array", items: { type: "string" }, description: "New tags" },
+        wing: { type: "string", description: "Move to wing (auto-created if new)" },
+        room: { type: "string", description: "Move to room (auto-created if new, requires wing)" },
+        hall: { type: "string", description: "Change hall type", enum: ["facts", "events", "discoveries", "preferences", "advice"] },
+        importance: { type: "number", description: "Set importance 0-10" },
       },
       required: ["id"],
     },
@@ -129,6 +146,59 @@ const TOOLS = [
       required: ["id"],
     },
   },
+  {
+    name: "palace_overview",
+    description: "Show the full memory palace structure: wings, rooms, halls, tunnels, and memory counts. Use this to understand the organization of all stored memories.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "palace_manage",
+    description: "Manage palace structure: create/delete wings, rooms, or tunnels (cross-references between rooms).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          description: "Action to perform",
+          enum: ["create_wing", "create_room", "create_tunnel", "delete_wing", "delete_room", "delete_tunnel"],
+        },
+        wing: { type: "string", description: "Wing name (for create/delete wing or room)" },
+        wing_type: { type: "string", description: "Wing type (for create_wing)", enum: ["person", "project"] },
+        room: { type: "string", description: "Room name (for create/delete room)" },
+        description: { type: "string", description: "Description for the wing, room, or tunnel" },
+        room_a: { type: "string", description: "First room (format: 'wing/room') for tunnel" },
+        room_b: { type: "string", description: "Second room (format: 'wing/room') for tunnel" },
+        id: { type: "string", description: "ID for delete operations" },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    name: "closet_create",
+    description: "Create a closet — a summary memory that points to original source memories. Useful for condensing multiple related memories into one overview.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "Summary content" },
+        source_ids: { type: "array", items: { type: "string" }, description: "Array of memory IDs being summarized" },
+        wing: { type: "string", description: "Wing name" },
+        room: { type: "string", description: "Room name" },
+        hall: { type: "string", description: "Hall type", enum: ["facts", "events", "discoveries", "preferences", "advice"] },
+        tags: { type: "array", items: { type: "string" }, description: "Tags" },
+      },
+      required: ["content", "source_ids"],
+    },
+  },
+  {
+    name: "wakeup_context",
+    description: "Get the most important memories for session start. Returns high-importance memories across all wings, providing essential context to resume work effectively.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Max memories to return (default 10)" },
+      },
+    },
+  },
 ];
 
 // --- Shared helpers ---
@@ -139,11 +209,79 @@ function textResult(text: string) {
 
 function formatMemory(r: any, extra?: string): string {
   const tags = JSON.parse(r.tags || "[]").join(", ") || "none";
-  let text = `**[${r.id}]** (${extra ? `${extra}, ` : ""}${r.category})\n${r.content}\nTags: ${tags} | Created: ${r.created_at}`;
+  const parts = [extra, r.category, r.hall].filter(Boolean).join(", ");
+  const location = [r.wing_name, r.room_name].filter(Boolean).join("/");
+  const closetFlag = r.is_closet ? " [closet]" : "";
+  const impFlag = r.importance > 0 ? ` imp:${r.importance}` : "";
+  let text = `**[${r.id}]** (${parts}${closetFlag}${impFlag})`;
+  if (location) text += ` 📍${location}`;
+  text += `\n${r.content}\nTags: ${tags} | Created: ${r.created_at}`;
   if (r.updated_at && r.updated_at !== r.created_at) {
     text += `\nUpdated: ${r.updated_at}`;
   }
   return text;
+}
+
+// Resolve wing/room names to IDs, auto-creating if needed
+async function resolveWingRoom(
+  env: Env,
+  wingName?: string,
+  roomName?: string,
+  wingType?: string,
+): Promise<{ wingId: string | null; roomId: string | null }> {
+  if (!wingName) return { wingId: null, roomId: null };
+
+  let wing = (await env.DB.prepare("SELECT id FROM wings WHERE name = ?")
+    .bind(wingName).first()) as any;
+  if (!wing) {
+    const wingId = crypto.randomUUID();
+    await env.DB.prepare(
+      "INSERT INTO wings (id, name, type, created_at) VALUES (?, ?, ?, ?)",
+    ).bind(wingId, wingName, wingType || "project", new Date().toISOString()).run();
+    wing = { id: wingId };
+  }
+
+  if (!roomName) return { wingId: wing.id, roomId: null };
+
+  let room = (await env.DB.prepare(
+    "SELECT id FROM rooms WHERE wing_id = ? AND name = ?",
+  ).bind(wing.id, roomName).first()) as any;
+  if (!room) {
+    const roomId = crypto.randomUUID();
+    await env.DB.prepare(
+      "INSERT INTO rooms (id, wing_id, name, created_at) VALUES (?, ?, ?, ?)",
+    ).bind(roomId, wing.id, roomName, new Date().toISOString()).run();
+    room = { id: roomId };
+  }
+
+  return { wingId: wing.id, roomId: room.id };
+}
+
+// Build SELECT with LEFT JOINs for wing/room names
+const MEMORY_SELECT = `SELECT m.*, w.name as wing_name, r.name as room_name
+  FROM memories m
+  LEFT JOIN wings w ON m.wing_id = w.id
+  LEFT JOIN rooms r ON m.room_id = r.id`;
+
+async function resolveWingRoomFilters(
+  env: Env,
+  wingName?: string,
+  roomName?: string,
+): Promise<{ wingId?: string; roomId?: string }> {
+  const result: { wingId?: string; roomId?: string } = {};
+  if (wingName) {
+    const wing = (await env.DB.prepare("SELECT id FROM wings WHERE name = ?")
+      .bind(wingName).first()) as any;
+    if (wing) result.wingId = wing.id;
+    else return { wingId: "NOTFOUND" };
+  }
+  if (roomName && result.wingId) {
+    const room = (await env.DB.prepare("SELECT id FROM rooms WHERE wing_id = ? AND name = ?")
+      .bind(result.wingId, roomName).first()) as any;
+    if (room) result.roomId = room.id;
+    else return { wingId: result.wingId, roomId: "NOTFOUND" };
+  }
+  return result;
 }
 
 function createSseStream(
@@ -531,32 +669,41 @@ async function embed(text: string, env: Env): Promise<number[]> {
 // --- Tool implementations ---
 
 async function memoryStore(
-  args: { content: string; category?: string; tags?: string[] },
+  args: {
+    content: string; category?: string; tags?: string[];
+    wing?: string; wing_type?: string; room?: string;
+    hall?: string; importance?: number;
+  },
   env: Env,
 ) {
   const id = crypto.randomUUID();
   const category = args.category || "general";
   const tags = JSON.stringify(args.tags || []);
+  const hall = args.hall || "facts";
+  const importance = Math.min(Math.max(args.importance || 0, 0), 10);
   const now = new Date().toISOString();
 
-  const [embedding] = await Promise.all([
+  const [embedding, { wingId, roomId }] = await Promise.all([
     embed(args.content, env),
-    env.DB.prepare(
-      "INSERT INTO memories (id, content, category, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-      .bind(id, args.content, category, tags, now, now)
-      .run(),
+    resolveWingRoom(env, args.wing, args.room, args.wing_type),
   ]);
+
+  await env.DB.prepare(
+    "INSERT INTO memories (id, content, category, tags, wing_id, room_id, hall, importance, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  )
+    .bind(id, args.content, category, tags, wingId, roomId, hall, importance, now, now)
+    .run();
 
   await env.VECTORIZE.upsert([
     { id, values: embedding, metadata: { category } },
   ]);
 
-  return textResult(`Stored memory [${id}] in category "${category}"`);
+  const location = [args.wing, args.room].filter(Boolean).join("/");
+  return textResult(`Stored memory [${id}] in ${category}/${hall}${location ? ` 📍${location}` : ""}${importance > 0 ? ` (importance: ${importance})` : ""}`);
 }
 
 async function memorySearch(
-  args: { query: string; category?: string; limit?: number },
+  args: { query: string; category?: string; wing?: string; room?: string; hall?: string; limit?: number },
   env: Env,
 ) {
   const limit = Math.min(args.limit || 10, 50);
@@ -570,114 +717,120 @@ async function memorySearch(
     returnMetadata: "all",
   });
 
-  if (!matches.matches.length) {
-    return textResult("No memories found.");
-  }
+  if (!matches.matches.length) return textResult("No memories found.");
 
   const ids = matches.matches.map((m) => m.id);
   const placeholders = ids.map(() => "?").join(",");
-  const { results } = await env.DB.prepare(
-    `SELECT * FROM memories WHERE id IN (${placeholders})`,
-  )
-    .bind(...ids)
-    .all();
+
+  let query = `${MEMORY_SELECT} WHERE m.id IN (${placeholders})`;
+  const binds: unknown[] = [...ids];
+
+  // Post-filter by palace location and hall
+  const filters = await resolveWingRoomFilters(env, args.wing, args.room);
+  if (filters.wingId) { query += " AND m.wing_id = ?"; binds.push(filters.wingId); }
+  if (filters.roomId) { query += " AND m.room_id = ?"; binds.push(filters.roomId); }
+  if (args.hall) { query += " AND m.hall = ?"; binds.push(args.hall); }
+
+  const { results } = await env.DB.prepare(query).bind(...binds).all();
+
+  if (!(results as any[]).length) return textResult("No memories found.");
 
   const scoreMap = new Map(matches.matches.map((m) => [m.id, m.score]));
 
   const text = (results as any[])
     .sort((a, b) => (scoreMap.get(b.id) || 0) - (scoreMap.get(a.id) || 0))
-    .map((r) => {
-      const score = (scoreMap.get(r.id) || 0).toFixed(3);
-      return formatMemory(r, `relevance: ${score}`);
-    })
+    .map((r) => formatMemory(r, `relevance: ${(scoreMap.get(r.id) || 0).toFixed(3)}`))
     .join("\n\n---\n\n");
 
   return textResult(text);
 }
 
 async function memoryList(
-  args: { category?: string; tag?: string; limit?: number; offset?: number },
+  args: { category?: string; tag?: string; wing?: string; room?: string; hall?: string; limit?: number; offset?: number },
   env: Env,
 ) {
   const limit = Math.min(args.limit || 20, 100);
   const offset = args.offset || 0;
 
-  let query = "SELECT * FROM memories";
+  let query = MEMORY_SELECT;
   const conditions: string[] = [];
   const binds: unknown[] = [];
 
-  if (args.category) {
-    conditions.push("category = ?");
-    binds.push(args.category);
-  }
-  if (args.tag) {
-    conditions.push("tags LIKE ?");
-    binds.push(`%"${args.tag}"%`);
-  }
+  if (args.category) { conditions.push("m.category = ?"); binds.push(args.category); }
+  if (args.tag) { conditions.push("m.tags LIKE ?"); binds.push(`%"${args.tag}"%`); }
+  if (args.hall) { conditions.push("m.hall = ?"); binds.push(args.hall); }
+
+  const filters = await resolveWingRoomFilters(env, args.wing, args.room);
+  if (filters.wingId) { conditions.push("m.wing_id = ?"); binds.push(filters.wingId); }
+  if (filters.roomId) { conditions.push("m.room_id = ?"); binds.push(filters.roomId); }
 
   if (conditions.length) query += " WHERE " + conditions.join(" AND ");
-  query += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+  query += " ORDER BY m.importance DESC, m.created_at DESC LIMIT ? OFFSET ?";
   binds.push(limit, offset);
 
-  const { results } = await env.DB.prepare(query)
-    .bind(...binds)
-    .all();
+  const { results } = await env.DB.prepare(query).bind(...binds).all();
 
-  if (!(results as any[]).length) {
-    return textResult("No memories found.");
-  }
+  if (!(results as any[]).length) return textResult("No memories found.");
 
-  const text = (results as any[])
-    .map((r) => formatMemory(r))
-    .join("\n\n---\n\n");
-
+  const text = (results as any[]).map((r) => formatMemory(r)).join("\n\n---\n\n");
   return textResult(text);
 }
 
 async function memoryGet(args: { id: string }, env: Env) {
-  const r = (await env.DB.prepare("SELECT * FROM memories WHERE id = ?")
-    .bind(args.id)
-    .first()) as any;
+  const r = (await env.DB.prepare(
+    `${MEMORY_SELECT} WHERE m.id = ?`,
+  ).bind(args.id).first()) as any;
 
   if (!r) return textResult(`Memory [${args.id}] not found.`);
-  return textResult(formatMemory(r));
+
+  let text = formatMemory(r);
+  if (r.is_closet && r.source_ids) {
+    const sourceIds = JSON.parse(r.source_ids || "[]");
+    if (sourceIds.length) text += `\nSources: ${sourceIds.join(", ")}`;
+  }
+  return textResult(text);
 }
 
 async function memoryUpdate(
-  args: { id: string; content?: string; category?: string; tags?: string[] },
+  args: {
+    id: string; content?: string; category?: string; tags?: string[];
+    wing?: string; room?: string; hall?: string; importance?: number;
+  },
   env: Env,
 ) {
   const existing = (await env.DB.prepare(
-    "SELECT content, category, tags FROM memories WHERE id = ?",
-  )
-    .bind(args.id)
-    .first()) as any;
+    "SELECT content, category, tags, hall, importance FROM memories WHERE id = ?",
+  ).bind(args.id).first()) as any;
 
   if (!existing) return textResult(`Memory [${args.id}] not found.`);
 
   const content = args.content || existing.content;
   const category = args.category || existing.category;
   const tags = args.tags ? JSON.stringify(args.tags) : existing.tags;
+  const hall = args.hall || existing.hall || "facts";
+  const importance = args.importance !== undefined ? Math.min(Math.max(args.importance, 0), 10) : (existing.importance || 0);
   const now = new Date().toISOString();
+
+  const { wingId, roomId } = await resolveWingRoom(env, args.wing, args.room);
+
+  const setClauses = [
+    "content = ?", "category = ?", "tags = ?", "hall = ?", "importance = ?", "updated_at = ?",
+  ];
+  const setBinds: unknown[] = [content, category, tags, hall, importance, now];
+
+  if (wingId !== null) { setClauses.push("wing_id = ?"); setBinds.push(wingId); }
+  if (roomId !== null) { setClauses.push("room_id = ?"); setBinds.push(roomId); }
+
+  setBinds.push(args.id);
 
   if (args.content) {
     const [embedding] = await Promise.all([
       embed(content, env),
-      env.DB.prepare(
-        "UPDATE memories SET content = ?, category = ?, tags = ?, updated_at = ? WHERE id = ?",
-      )
-        .bind(content, category, tags, now, args.id)
-        .run(),
+      env.DB.prepare(`UPDATE memories SET ${setClauses.join(", ")} WHERE id = ?`).bind(...setBinds).run(),
     ]);
-    await env.VECTORIZE.upsert([
-      { id: args.id, values: embedding, metadata: { category } },
-    ]);
+    await env.VECTORIZE.upsert([{ id: args.id, values: embedding, metadata: { category } }]);
   } else {
-    await env.DB.prepare(
-      "UPDATE memories SET content = ?, category = ?, tags = ?, updated_at = ? WHERE id = ?",
-    )
-      .bind(content, category, tags, now, args.id)
-      .run();
+    await env.DB.prepare(`UPDATE memories SET ${setClauses.join(", ")} WHERE id = ?`).bind(...setBinds).run();
   }
 
   return textResult(`Updated memory [${args.id}]`);
@@ -692,6 +845,203 @@ async function memoryDelete(args: { id: string }, env: Env) {
 
   await env.VECTORIZE.deleteByIds([args.id]);
   return textResult(`Deleted memory [${args.id}]`);
+}
+
+// --- Palace tools ---
+
+async function palaceOverview(env: Env) {
+  const wings = (await env.DB.prepare(
+    "SELECT w.*, (SELECT COUNT(*) FROM memories WHERE wing_id = w.id) as mem_count FROM wings w ORDER BY w.name",
+  ).all()).results as any[];
+
+  const rooms = (await env.DB.prepare(
+    "SELECT r.*, w.name as wing_name, (SELECT COUNT(*) FROM memories WHERE room_id = r.id) as mem_count FROM rooms r JOIN wings w ON r.wing_id = w.id ORDER BY w.name, r.name",
+  ).all()).results as any[];
+
+  const tunnels = (await env.DB.prepare(
+    `SELECT t.id, t.description, ra.name as room_a, wa.name as wing_a, rb.name as room_b, wb.name as wing_b
+     FROM tunnels t
+     JOIN rooms ra ON t.room_a_id = ra.id JOIN wings wa ON ra.wing_id = wa.id
+     JOIN rooms rb ON t.room_b_id = rb.id JOIN wings wb ON rb.wing_id = wb.id`,
+  ).all()).results as any[];
+
+  const unorganized = (await env.DB.prepare(
+    "SELECT COUNT(*) as cnt FROM memories WHERE wing_id IS NULL",
+  ).first()) as any;
+
+  const hallCounts = (await env.DB.prepare(
+    "SELECT wing_id, room_id, hall, COUNT(*) as cnt FROM memories WHERE wing_id IS NOT NULL GROUP BY wing_id, room_id, hall",
+  ).all()).results as any[];
+
+  const hallMap = new Map<string, Map<string, number>>();
+  for (const h of hallCounts) {
+    const key = h.room_id || h.wing_id;
+    if (!hallMap.has(key)) hallMap.set(key, new Map());
+    hallMap.get(key)!.set(h.hall || "facts", h.cnt);
+  }
+
+  let text = "# Memory Palace\n\n";
+
+  if (!wings.length && !unorganized?.cnt) return textResult("Palace is empty. Store memories with wing/room to build the structure.");
+
+  for (const wing of wings) {
+    text += `## 🏛️ ${wing.name} (${wing.type}) — ${wing.mem_count} memories\n`;
+    if (wing.description) text += `  ${wing.description}\n`;
+
+    const wingRooms = rooms.filter((r) => r.wing_name === wing.name);
+    if (wingRooms.length) {
+      for (const room of wingRooms) {
+        text += `  ### 🚪 ${room.name} — ${room.mem_count} memories\n`;
+        const halls = hallMap.get(room.id);
+        if (halls) {
+          for (const [hall, count] of halls) text += `    - ${hall}: ${count}\n`;
+        }
+      }
+    }
+
+    // Wing memories not in rooms
+    const wingHalls = hallMap.get(wing.id);
+    if (wingHalls) {
+      text += `  ### (no room)\n`;
+      for (const [hall, count] of wingHalls) text += `    - ${hall}: ${count}\n`;
+    }
+    text += "\n";
+  }
+
+  if (tunnels.length) {
+    text += "## 🔗 Tunnels\n";
+    for (const t of tunnels) {
+      text += `- ${t.wing_a}/${t.room_a} ↔ ${t.wing_b}/${t.room_b}`;
+      if (t.description) text += ` — ${t.description}`;
+      text += ` [${t.id}]\n`;
+    }
+    text += "\n";
+  }
+
+  if (unorganized?.cnt > 0) {
+    text += `## 📦 Unorganized — ${unorganized.cnt} memories\n`;
+  }
+
+  return textResult(text);
+}
+
+async function palaceManage(
+  args: {
+    action: string;
+    wing?: string; wing_type?: string; room?: string;
+    description?: string; room_a?: string; room_b?: string; id?: string;
+  },
+  env: Env,
+) {
+  const now = new Date().toISOString();
+
+  switch (args.action) {
+    case "create_wing": {
+      if (!args.wing) return textResult("Error: wing name required.");
+      const existing = await env.DB.prepare("SELECT id FROM wings WHERE name = ?").bind(args.wing).first();
+      if (existing) return textResult(`Wing "${args.wing}" already exists.`);
+      const id = crypto.randomUUID();
+      await env.DB.prepare("INSERT INTO wings (id, name, type, description, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(id, args.wing, args.wing_type || "project", args.description || null, now).run();
+      return textResult(`Created wing "${args.wing}" (${args.wing_type || "project"}) [${id}]`);
+    }
+    case "create_room": {
+      if (!args.wing || !args.room) return textResult("Error: wing and room names required.");
+      const wing = (await env.DB.prepare("SELECT id FROM wings WHERE name = ?").bind(args.wing).first()) as any;
+      if (!wing) return textResult(`Wing "${args.wing}" not found. Create it first.`);
+      const existing = await env.DB.prepare("SELECT id FROM rooms WHERE wing_id = ? AND name = ?").bind(wing.id, args.room).first();
+      if (existing) return textResult(`Room "${args.room}" already exists in wing "${args.wing}".`);
+      const id = crypto.randomUUID();
+      await env.DB.prepare("INSERT INTO rooms (id, wing_id, name, description, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(id, wing.id, args.room, args.description || null, now).run();
+      return textResult(`Created room "${args.room}" in wing "${args.wing}" [${id}]`);
+    }
+    case "create_tunnel": {
+      if (!args.room_a || !args.room_b) return textResult("Error: room_a and room_b required (format: 'wing/room').");
+      const [wingA, roomA] = args.room_a.split("/");
+      const [wingB, roomB] = args.room_b.split("/");
+      const rA = (await env.DB.prepare("SELECT r.id FROM rooms r JOIN wings w ON r.wing_id = w.id WHERE w.name = ? AND r.name = ?")
+        .bind(wingA, roomA).first()) as any;
+      const rB = (await env.DB.prepare("SELECT r.id FROM rooms r JOIN wings w ON r.wing_id = w.id WHERE w.name = ? AND r.name = ?")
+        .bind(wingB, roomB).first()) as any;
+      if (!rA || !rB) return textResult("Error: one or both rooms not found.");
+      const id = crypto.randomUUID();
+      await env.DB.prepare("INSERT INTO tunnels (id, room_a_id, room_b_id, description, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(id, rA.id, rB.id, args.description || null, now).run();
+      return textResult(`Created tunnel: ${args.room_a} ↔ ${args.room_b} [${id}]`);
+    }
+    case "delete_wing": {
+      if (!args.id && !args.wing) return textResult("Error: wing id or name required.");
+      const where = args.id ? "id = ?" : "name = ?";
+      const bind = args.id || args.wing!;
+      const result = await env.DB.prepare(`DELETE FROM wings WHERE ${where}`).bind(bind).run();
+      return result.meta.changes ? textResult(`Deleted wing.`) : textResult("Wing not found.");
+    }
+    case "delete_room": {
+      if (!args.id) return textResult("Error: room id required.");
+      const result = await env.DB.prepare("DELETE FROM rooms WHERE id = ?").bind(args.id).run();
+      return result.meta.changes ? textResult(`Deleted room.`) : textResult("Room not found.");
+    }
+    case "delete_tunnel": {
+      if (!args.id) return textResult("Error: tunnel id required.");
+      const result = await env.DB.prepare("DELETE FROM tunnels WHERE id = ?").bind(args.id).run();
+      return result.meta.changes ? textResult(`Deleted tunnel.`) : textResult("Tunnel not found.");
+    }
+    default:
+      return textResult(`Unknown action: ${args.action}`);
+  }
+}
+
+async function closetCreate(
+  args: {
+    content: string; source_ids: string[];
+    wing?: string; room?: string; hall?: string; tags?: string[];
+  },
+  env: Env,
+) {
+  const id = crypto.randomUUID();
+  const tags = JSON.stringify(args.tags || []);
+  const hall = args.hall || "facts";
+  const sourceIds = JSON.stringify(args.source_ids);
+  const now = new Date().toISOString();
+
+  const [embedding, { wingId, roomId }] = await Promise.all([
+    embed(args.content, env),
+    resolveWingRoom(env, args.wing, args.room),
+  ]);
+
+  await env.DB.prepare(
+    "INSERT INTO memories (id, content, category, tags, wing_id, room_id, hall, is_closet, source_ids, importance, created_at, updated_at) VALUES (?, ?, 'reference', ?, ?, ?, ?, 1, ?, 5, ?, ?)",
+  ).bind(id, args.content, tags, wingId, roomId, hall, sourceIds, now, now).run();
+
+  await env.VECTORIZE.upsert([{ id, values: embedding, metadata: { category: "reference" } }]);
+
+  return textResult(`Created closet [${id}] summarizing ${args.source_ids.length} memories`);
+}
+
+async function wakeupContext(args: { limit?: number }, env: Env) {
+  const limit = Math.min(args.limit || 10, 30);
+
+  const { results } = await env.DB.prepare(
+    `${MEMORY_SELECT} WHERE m.importance > 0 ORDER BY m.importance DESC, m.updated_at DESC LIMIT ?`,
+  ).bind(limit).all();
+
+  if (!(results as any[]).length) {
+    // Fallback: most recent memories
+    const fallback = await env.DB.prepare(
+      `${MEMORY_SELECT} ORDER BY m.updated_at DESC LIMIT ?`,
+    ).bind(limit).all();
+
+    if (!(fallback.results as any[]).length) return textResult("No memories yet.");
+
+    const text = "# Wake-up Context (recent, no importance set)\n\n" +
+      (fallback.results as any[]).map((r) => formatMemory(r)).join("\n\n---\n\n");
+    return textResult(text);
+  }
+
+  const text = "# Wake-up Context\n\n" +
+    (results as any[]).map((r) => formatMemory(r)).join("\n\n---\n\n");
+  return textResult(text);
 }
 
 // --- Tool dispatcher ---
@@ -710,6 +1060,14 @@ async function callTool(name: string, args: Record<string, unknown>, env: Env) {
       return memoryUpdate(args as any, env);
     case "memory_delete":
       return memoryDelete(args as any, env);
+    case "palace_overview":
+      return palaceOverview(env);
+    case "palace_manage":
+      return palaceManage(args as any, env);
+    case "closet_create":
+      return closetCreate(args as any, env);
+    case "wakeup_context":
+      return wakeupContext(args as any, env);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
