@@ -21,6 +21,23 @@ interface JsonRpcResponse {
 }
 
 const SERVER_INFO = { name: "memory-mcp-server", version: "1.0.0" };
+const ACCESS_TOKEN_TTL_S = 30 * 24 * 60 * 60;
+const REFRESH_TOKEN_TTL_S = 90 * 24 * 60 * 60;
+const SSE_KEEPALIVE_MS = 15000;
+const encoder = new TextEncoder();
+
+const CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+const SSE_HEADERS: Record<string, string> = {
+  "Content-Type": "text/event-stream",
+  "Cache-Control": "no-cache",
+  Connection: "keep-alive",
+  ...CORS_HEADERS,
+};
 
 const TOOLS = [
   {
@@ -114,9 +131,75 @@ const TOOLS = [
   },
 ];
 
-// =====================
-// OAuth 2.0 + PKCE
-// =====================
+// --- Shared helpers ---
+
+function textResult(text: string) {
+  return { content: [{ type: "text", text }] };
+}
+
+function formatMemory(r: any, extra?: string): string {
+  const tags = JSON.parse(r.tags || "[]").join(", ") || "none";
+  let text = `**[${r.id}]** (${extra ? `${extra}, ` : ""}${r.category})\n${r.content}\nTags: ${tags} | Created: ${r.created_at}`;
+  if (r.updated_at && r.updated_at !== r.created_at) {
+    text += `\nUpdated: ${r.updated_at}`;
+  }
+  return text;
+}
+
+function createSseStream(
+  endpointUrl: string,
+  onController?: (c: ReadableStreamDefaultController<Uint8Array>) => void,
+  onCleanup?: () => void,
+): ReadableStream<Uint8Array> {
+  let keepAlive: ReturnType<typeof setInterval>;
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      onController?.(controller);
+      controller.enqueue(
+        encoder.encode(`event: endpoint\ndata: ${endpointUrl}\n\n`),
+      );
+      keepAlive = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(`: keepalive\n\n`));
+        } catch {
+          clearInterval(keepAlive);
+          onCleanup?.();
+        }
+      }, SSE_KEEPALIVE_MS);
+    },
+    cancel() {
+      clearInterval(keepAlive);
+      onCleanup?.();
+    },
+  });
+}
+
+async function handleJsonRpcPost(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const body = await request.json();
+  if (Array.isArray(body)) {
+    const responses = await Promise.all(
+      body.map((r: JsonRpcRequest) => processRequest(r, env)),
+    );
+    return Response.json(responses.filter(Boolean), { headers: CORS_HEADERS });
+  }
+  const response = await processRequest(body as JsonRpcRequest, env);
+  if (!response) {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+  return Response.json(response, { headers: CORS_HEADERS });
+}
+
+function parseBearer(request: Request): string | null {
+  const auth = request.headers.get("Authorization");
+  if (!auth) return null;
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1] : null;
+}
+
+// --- OAuth 2.0 + PKCE ---
 
 function protectedResourceMetadata(origin: string) {
   return {
@@ -142,7 +225,7 @@ function oauthMetadata(origin: string) {
 }
 
 async function sha256base64url(input: string): Promise<string> {
-  const data = new TextEncoder().encode(input);
+  const data = encoder.encode(input);
   const hash = await crypto.subtle.digest("SHA-256", data);
   const bytes = new Uint8Array(hash);
   let binary = "";
@@ -245,7 +328,6 @@ async function handleAuthorizePost(
     return new Response("Missing redirect_uri", { status: 400 });
   }
 
-  // Validate token
   if (token !== env.API_TOKEN) {
     const html = authorizeHTML({
       client_id,
@@ -262,7 +344,6 @@ async function handleAuthorizePost(
     });
   }
 
-  // Generate auth code
   const code = generateToken();
   const now = new Date().toISOString();
 
@@ -272,7 +353,6 @@ async function handleAuthorizePost(
     .bind(code, client_id, redirect_uri, code_challenge, code_challenge_method, now)
     .run();
 
-  // Redirect back with code
   const redirectUrl = new URL(redirect_uri);
   redirectUrl.searchParams.set("code", code);
   if (state) redirectUrl.searchParams.set("state", state);
@@ -280,10 +360,46 @@ async function handleAuthorizePost(
   return Response.redirect(redirectUrl.toString(), 302);
 }
 
-async function handleToken(request: Request, env: Env): Promise<Response> {
-  const headers = { "Content-Type": "application/json", ...corsHeaders() };
+async function issueTokenPair(
+  env: Env,
+  clientId: string,
+  extraStatements: D1PreparedStatement[] = [],
+): Promise<Response> {
+  const access_token = generateToken();
+  const refresh_token = generateToken();
+  const now = new Date().toISOString();
+  const accessExpires = new Date(
+    Date.now() + ACCESS_TOKEN_TTL_S * 1000,
+  ).toISOString();
+  const refreshExpires = new Date(
+    Date.now() + REFRESH_TOKEN_TTL_S * 1000,
+  ).toISOString();
 
-  // Parse body (support both form and JSON)
+  await env.DB.batch([
+    ...extraStatements,
+    env.DB.prepare(
+      "INSERT INTO oauth_tokens (token, type, client_id, created_at, expires_at) VALUES (?, 'access', ?, ?, ?)",
+    ).bind(access_token, clientId, now, accessExpires),
+    env.DB.prepare(
+      "INSERT INTO oauth_tokens (token, type, client_id, created_at, expires_at) VALUES (?, 'refresh', ?, ?, ?)",
+    ).bind(refresh_token, clientId, now, refreshExpires),
+  ]);
+
+  return Response.json(
+    {
+      access_token,
+      token_type: "Bearer",
+      expires_in: ACCESS_TOKEN_TTL_S,
+      refresh_token,
+      scope: "mcp",
+    },
+    { headers: { "Content-Type": "application/json", ...CORS_HEADERS } },
+  );
+}
+
+async function handleToken(request: Request, env: Env): Promise<Response> {
+  const errorHeaders = { "Content-Type": "application/json", ...CORS_HEADERS };
+
   let params: Record<string, string>;
   const ct = request.headers.get("Content-Type") || "";
   if (ct.includes("application/json")) {
@@ -297,26 +413,23 @@ async function handleToken(request: Request, env: Env): Promise<Response> {
   }
 
   const grant_type = params.grant_type;
-
-  // Cleanup expired codes/tokens
   const now = new Date().toISOString();
-  await env.DB.prepare("DELETE FROM oauth_tokens WHERE expires_at < ?")
-    .bind(now)
-    .run();
+
+  // Deferred cleanup — don't block the response
   const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-  await env.DB.prepare("DELETE FROM oauth_codes WHERE created_at < ?")
-    .bind(fiveMinAgo)
-    .run();
+  void env.DB.batch([
+    env.DB.prepare("DELETE FROM oauth_tokens WHERE expires_at < ?").bind(now),
+    env.DB.prepare("DELETE FROM oauth_codes WHERE created_at < ?").bind(fiveMinAgo),
+  ]);
 
   if (grant_type === "authorization_code") {
     const code = params.code;
     const code_verifier = params.code_verifier;
 
     if (!code) {
-      return Response.json({ error: "invalid_request", error_description: "Missing code" }, { status: 400, headers });
+      return Response.json({ error: "invalid_request", error_description: "Missing code" }, { status: 400, headers: errorHeaders });
     }
 
-    // Look up code
     const stored = (await env.DB.prepare(
       "SELECT * FROM oauth_codes WHERE code = ?",
     )
@@ -324,60 +437,30 @@ async function handleToken(request: Request, env: Env): Promise<Response> {
       .first()) as any;
 
     if (!stored) {
-      return Response.json({ error: "invalid_grant", error_description: "Invalid or expired code" }, { status: 400, headers });
+      return Response.json({ error: "invalid_grant", error_description: "Invalid or expired code" }, { status: 400, headers: errorHeaders });
     }
 
-    // Delete used code immediately
     await env.DB.prepare("DELETE FROM oauth_codes WHERE code = ?")
       .bind(code)
       .run();
 
-    // Verify PKCE if code_challenge was provided
     if (stored.code_challenge) {
       if (!code_verifier) {
-        return Response.json({ error: "invalid_grant", error_description: "Missing code_verifier" }, { status: 400, headers });
+        return Response.json({ error: "invalid_grant", error_description: "Missing code_verifier" }, { status: 400, headers: errorHeaders });
       }
       const computed = await sha256base64url(code_verifier);
       if (computed !== stored.code_challenge) {
-        return Response.json({ error: "invalid_grant", error_description: "Invalid code_verifier" }, { status: 400, headers });
+        return Response.json({ error: "invalid_grant", error_description: "Invalid code_verifier" }, { status: 400, headers: errorHeaders });
       }
     }
 
-    // Generate tokens
-    const access_token = generateToken();
-    const refresh_token = generateToken();
-    const accessExpires = new Date(
-      Date.now() + 30 * 24 * 60 * 60 * 1000,
-    ).toISOString(); // 30 days
-    const refreshExpires = new Date(
-      Date.now() + 90 * 24 * 60 * 60 * 1000,
-    ).toISOString(); // 90 days
-
-    await env.DB.batch([
-      env.DB.prepare(
-        "INSERT INTO oauth_tokens (token, type, client_id, created_at, expires_at) VALUES (?, 'access', ?, ?, ?)",
-      ).bind(access_token, stored.client_id, now, accessExpires),
-      env.DB.prepare(
-        "INSERT INTO oauth_tokens (token, type, client_id, created_at, expires_at) VALUES (?, 'refresh', ?, ?, ?)",
-      ).bind(refresh_token, stored.client_id, now, refreshExpires),
-    ]);
-
-    return Response.json(
-      {
-        access_token,
-        token_type: "Bearer",
-        expires_in: 30 * 24 * 60 * 60,
-        refresh_token,
-        scope: "mcp",
-      },
-      { headers },
-    );
+    return issueTokenPair(env, stored.client_id);
   }
 
   if (grant_type === "refresh_token") {
     const refresh_token = params.refresh_token;
     if (!refresh_token) {
-      return Response.json({ error: "invalid_request", error_description: "Missing refresh_token" }, { status: 400, headers });
+      return Response.json({ error: "invalid_request", error_description: "Missing refresh_token" }, { status: 400, headers: errorHeaders });
     }
 
     const stored = (await env.DB.prepare(
@@ -387,50 +470,20 @@ async function handleToken(request: Request, env: Env): Promise<Response> {
       .first()) as any;
 
     if (!stored) {
-      return Response.json({ error: "invalid_grant", error_description: "Invalid or expired refresh token" }, { status: 400, headers });
+      return Response.json({ error: "invalid_grant", error_description: "Invalid or expired refresh token" }, { status: 400, headers: errorHeaders });
     }
 
-    // Rotate: delete old refresh token, issue new access + refresh
-    const new_access = generateToken();
-    const new_refresh = generateToken();
-    const accessExpires = new Date(
-      Date.now() + 30 * 24 * 60 * 60 * 1000,
-    ).toISOString();
-    const refreshExpires = new Date(
-      Date.now() + 90 * 24 * 60 * 60 * 1000,
-    ).toISOString();
-
-    await env.DB.batch([
-      env.DB.prepare("DELETE FROM oauth_tokens WHERE token = ?").bind(
-        refresh_token,
-      ),
-      env.DB.prepare(
-        "INSERT INTO oauth_tokens (token, type, client_id, created_at, expires_at) VALUES (?, 'access', ?, ?, ?)",
-      ).bind(new_access, stored.client_id, now, accessExpires),
-      env.DB.prepare(
-        "INSERT INTO oauth_tokens (token, type, client_id, created_at, expires_at) VALUES (?, 'refresh', ?, ?, ?)",
-      ).bind(new_refresh, stored.client_id, now, refreshExpires),
+    return issueTokenPair(env, stored.client_id, [
+      env.DB.prepare("DELETE FROM oauth_tokens WHERE token = ?").bind(refresh_token),
     ]);
-
-    return Response.json(
-      {
-        access_token: new_access,
-        token_type: "Bearer",
-        expires_in: 30 * 24 * 60 * 60,
-        refresh_token: new_refresh,
-        scope: "mcp",
-      },
-      { headers },
-    );
   }
 
   return Response.json(
     { error: "unsupported_grant_type" },
-    { status: 400, headers },
+    { status: 400, headers: errorHeaders },
   );
 }
 
-// Dynamic client registration (RFC 7591)
 async function handleRegister(request: Request): Promise<Response> {
   const body = (await request.json()) as Record<string, unknown>;
   const client_id = generateToken();
@@ -445,23 +498,18 @@ async function handleRegister(request: Request): Promise<Response> {
       token_endpoint_auth_method: "none",
       scope: "mcp",
     },
-    { status: 201, headers: corsHeaders() },
+    { status: 201, headers: CORS_HEADERS },
   );
 }
 
-// =====================
-// Auth (supports both static token & OAuth)
-// =====================
+// --- Auth ---
 
 async function authenticate(request: Request, env: Env): Promise<boolean> {
-  const auth = request.headers.get("Authorization");
-  if (!auth) return false;
-  const token = auth.replace("Bearer ", "");
+  const token = parseBearer(request);
+  if (!token) return false;
 
-  // Static API token (Claude Code CLI)
   if (token === env.API_TOKEN) return true;
 
-  // OAuth access token
   const stored = await env.DB.prepare(
     "SELECT token FROM oauth_tokens WHERE token = ? AND type = 'access' AND expires_at > ?",
   )
@@ -471,17 +519,7 @@ async function authenticate(request: Request, env: Env): Promise<boolean> {
   return !!stored;
 }
 
-function corsHeaders(): Record<string, string> {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  };
-}
-
-// =====================
-// Embedding
-// =====================
+// --- Embedding ---
 
 async function embed(text: string, env: Env): Promise<number[]> {
   const res = (await env.AI.run("@cf/baai/bge-base-en-v1.5", {
@@ -490,9 +528,7 @@ async function embed(text: string, env: Env): Promise<number[]> {
   return res.data[0];
 }
 
-// =====================
-// Tool implementations
-// =====================
+// --- Tool implementations ---
 
 async function memoryStore(
   args: { content: string; category?: string; tags?: string[] },
@@ -503,26 +539,20 @@ async function memoryStore(
   const tags = JSON.stringify(args.tags || []);
   const now = new Date().toISOString();
 
-  const embedding = await embed(args.content, env);
-
-  await env.DB.prepare(
-    "INSERT INTO memories (id, content, category, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-  )
-    .bind(id, args.content, category, tags, now, now)
-    .run();
+  const [embedding] = await Promise.all([
+    embed(args.content, env),
+    env.DB.prepare(
+      "INSERT INTO memories (id, content, category, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+      .bind(id, args.content, category, tags, now, now)
+      .run(),
+  ]);
 
   await env.VECTORIZE.upsert([
     { id, values: embedding, metadata: { category } },
   ]);
 
-  return {
-    content: [
-      {
-        type: "text",
-        text: `Stored memory [${id}] in category "${category}"`,
-      },
-    ],
-  };
+  return textResult(`Stored memory [${id}] in category "${category}"`);
 }
 
 async function memorySearch(
@@ -532,17 +562,16 @@ async function memorySearch(
   const limit = Math.min(args.limit || 10, 50);
   const embedding = await embed(args.query, env);
 
-  const filter: Record<string, string> = {};
-  if (args.category) filter.category = args.category;
+  const filter = args.category ? { category: args.category } : undefined;
 
   const matches = await env.VECTORIZE.query(embedding, {
     topK: limit,
-    filter: Object.keys(filter).length > 0 ? filter : undefined,
+    filter,
     returnMetadata: "all",
   });
 
   if (!matches.matches.length) {
-    return { content: [{ type: "text", text: "No memories found." }] };
+    return textResult("No memories found.");
   }
 
   const ids = matches.matches.map((m) => m.id);
@@ -559,12 +588,11 @@ async function memorySearch(
     .sort((a, b) => (scoreMap.get(b.id) || 0) - (scoreMap.get(a.id) || 0))
     .map((r) => {
       const score = (scoreMap.get(r.id) || 0).toFixed(3);
-      const t = JSON.parse(r.tags || "[]").join(", ") || "none";
-      return `**[${r.id}]** (relevance: ${score}, category: ${r.category})\n${r.content}\nTags: ${t} | Created: ${r.created_at}`;
+      return formatMemory(r, `relevance: ${score}`);
     })
     .join("\n\n---\n\n");
 
-  return { content: [{ type: "text", text }] };
+  return textResult(text);
 }
 
 async function memoryList(
@@ -596,17 +624,14 @@ async function memoryList(
     .all();
 
   if (!(results as any[]).length) {
-    return { content: [{ type: "text", text: "No memories found." }] };
+    return textResult("No memories found.");
   }
 
   const text = (results as any[])
-    .map((r) => {
-      const t = JSON.parse(r.tags || "[]").join(", ") || "none";
-      return `**[${r.id}]** (${r.category})\n${r.content}\nTags: ${t} | Created: ${r.created_at}`;
-    })
+    .map((r) => formatMemory(r))
     .join("\n\n---\n\n");
 
-  return { content: [{ type: "text", text }] };
+  return textResult(text);
 }
 
 async function memoryGet(args: { id: string }, env: Env) {
@@ -614,21 +639,8 @@ async function memoryGet(args: { id: string }, env: Env) {
     .bind(args.id)
     .first()) as any;
 
-  if (!r) {
-    return {
-      content: [{ type: "text", text: `Memory [${args.id}] not found.` }],
-    };
-  }
-
-  const t = JSON.parse(r.tags || "[]").join(", ") || "none";
-  return {
-    content: [
-      {
-        type: "text",
-        text: `**[${r.id}]** (${r.category})\n${r.content}\nTags: ${t}\nCreated: ${r.created_at}\nUpdated: ${r.updated_at}`,
-      },
-    ],
-  };
+  if (!r) return textResult(`Memory [${args.id}] not found.`);
+  return textResult(formatMemory(r));
 }
 
 async function memoryUpdate(
@@ -636,66 +648,53 @@ async function memoryUpdate(
   env: Env,
 ) {
   const existing = (await env.DB.prepare(
-    "SELECT * FROM memories WHERE id = ?",
+    "SELECT content, category, tags FROM memories WHERE id = ?",
   )
     .bind(args.id)
     .first()) as any;
 
-  if (!existing) {
-    return {
-      content: [{ type: "text", text: `Memory [${args.id}] not found.` }],
-    };
-  }
+  if (!existing) return textResult(`Memory [${args.id}] not found.`);
 
   const content = args.content || existing.content;
   const category = args.category || existing.category;
   const tags = args.tags ? JSON.stringify(args.tags) : existing.tags;
   const now = new Date().toISOString();
 
-  await env.DB.prepare(
-    "UPDATE memories SET content = ?, category = ?, tags = ?, updated_at = ? WHERE id = ?",
-  )
-    .bind(content, category, tags, now, args.id)
-    .run();
-
   if (args.content) {
-    const embedding = await embed(content, env);
+    const [embedding] = await Promise.all([
+      embed(content, env),
+      env.DB.prepare(
+        "UPDATE memories SET content = ?, category = ?, tags = ?, updated_at = ? WHERE id = ?",
+      )
+        .bind(content, category, tags, now, args.id)
+        .run(),
+    ]);
     await env.VECTORIZE.upsert([
       { id: args.id, values: embedding, metadata: { category } },
     ]);
+  } else {
+    await env.DB.prepare(
+      "UPDATE memories SET content = ?, category = ?, tags = ?, updated_at = ? WHERE id = ?",
+    )
+      .bind(content, category, tags, now, args.id)
+      .run();
   }
 
-  return {
-    content: [{ type: "text", text: `Updated memory [${args.id}]` }],
-  };
+  return textResult(`Updated memory [${args.id}]`);
 }
 
 async function memoryDelete(args: { id: string }, env: Env) {
-  const existing = await env.DB.prepare(
-    "SELECT id FROM memories WHERE id = ?",
-  )
-    .bind(args.id)
-    .first();
-
-  if (!existing) {
-    return {
-      content: [{ type: "text", text: `Memory [${args.id}] not found.` }],
-    };
-  }
-
-  await env.DB.prepare("DELETE FROM memories WHERE id = ?")
+  const result = await env.DB.prepare("DELETE FROM memories WHERE id = ?")
     .bind(args.id)
     .run();
-  await env.VECTORIZE.deleteByIds([args.id]);
 
-  return {
-    content: [{ type: "text", text: `Deleted memory [${args.id}]` }],
-  };
+  if (!result.meta.changes) return textResult(`Memory [${args.id}] not found.`);
+
+  await env.VECTORIZE.deleteByIds([args.id]);
+  return textResult(`Deleted memory [${args.id}]`);
 }
 
-// =====================
-// Tool dispatcher
-// =====================
+// --- Tool dispatcher ---
 
 async function callTool(name: string, args: Record<string, unknown>, env: Env) {
   switch (name) {
@@ -716,9 +715,7 @@ async function callTool(name: string, args: Record<string, unknown>, env: Env) {
   }
 }
 
-// =====================
-// JSON-RPC handler
-// =====================
+// --- JSON-RPC handler ---
 
 async function processRequest(
   req: JsonRpcRequest,
@@ -775,71 +772,57 @@ async function processRequest(
   }
 }
 
-// =====================
-// Main Worker
-// =====================
+// --- Main Worker ---
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders() });
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // --- Public endpoints (no auth) ---
-
-    // Health check
+    // Public: health check
     if (path === "/" && request.method === "GET") {
       return Response.json(
         { status: "ok", server: SERVER_INFO },
-        { headers: corsHeaders() },
+        { headers: CORS_HEADERS },
       );
     }
 
-    // Protected Resource Metadata (RFC 9728)
+    // Public: OAuth discovery (RFC 9728 + RFC 8414)
     if (path === "/.well-known/oauth-protected-resource" && request.method === "GET") {
-      return Response.json(protectedResourceMetadata(url.origin), { headers: corsHeaders() });
+      return Response.json(protectedResourceMetadata(url.origin), { headers: CORS_HEADERS });
     }
-
-    // OAuth Authorization Server Metadata (RFC 8414)
     if (path === "/.well-known/oauth-authorization-server" && request.method === "GET") {
-      return Response.json(oauthMetadata(url.origin), { headers: corsHeaders() });
+      return Response.json(oauthMetadata(url.origin), { headers: CORS_HEADERS });
     }
 
-    // OAuth authorize
+    // Public: OAuth endpoints
     if (path === "/authorize" && request.method === "GET") {
       return handleAuthorizeGet(url);
     }
     if (path === "/authorize" && request.method === "POST") {
       return handleAuthorizePost(request, env);
     }
-
-    // OAuth token
     if (path === "/token" && request.method === "POST") {
       return handleToken(request, env);
     }
-
-    // Dynamic client registration
     if (path === "/register" && request.method === "POST") {
       return handleRegister(request);
     }
 
-    // --- Secret-path SSE endpoint (for claude.ai web, authless) ---
-    // Path: /s/<API_TOKEN>/sse and /s/<API_TOKEN>/message
-    // Security: the long random token in the URL acts as authentication
-
+    // Secret-path endpoints (token-in-URL auth for claude.ai web)
     const secretMatch = path.match(/^\/s\/([^/]+)(\/.*)?$/);
     if (secretMatch) {
       const pathToken = secretMatch[1];
       const subPath = secretMatch[2] || "/";
 
       if (pathToken !== env.API_TOKEN) {
-        return new Response("Not Found", { status: 404, headers: corsHeaders() });
+        return new Response("Not Found", { status: 404, headers: CORS_HEADERS });
       }
 
-      // SSE via Durable Object (for claude.ai web)
       if (subPath === "/sse" && request.method === "GET") {
         const sessionId = crypto.randomUUID();
         const doId = env.MCP_SESSION.idFromName(sessionId);
@@ -852,13 +835,12 @@ export default {
         );
       }
 
-      // Message via Durable Object
       if (subPath.startsWith("/message") && request.method === "POST") {
         const sessionId = url.searchParams.get("session");
         if (!sessionId) {
           return Response.json(
             { error: "Missing session" },
-            { status: 400, headers: corsHeaders() },
+            { status: 400, headers: CORS_HEADERS },
           );
         }
         const doId = env.MCP_SESSION.idFromName(sessionId);
@@ -872,105 +854,45 @@ export default {
         );
       }
 
-      // Streamable HTTP on secret path (fallback)
       if ((subPath === "/mcp" || subPath === "/") && request.method === "POST") {
-        const body = await request.json();
-        if (Array.isArray(body)) {
-          const responses = await Promise.all(
-            body.map((r: JsonRpcRequest) => processRequest(r, env)),
-          );
-          return Response.json(responses.filter(Boolean), { headers: corsHeaders() });
-        }
-        const response = await processRequest(body as JsonRpcRequest, env);
-        if (!response) {
-          return new Response(null, { status: 204, headers: corsHeaders() });
-        }
-        return Response.json(response, { headers: corsHeaders() });
+        return handleJsonRpcPost(request, env);
       }
 
-      return new Response("Not Found", { status: 404, headers: corsHeaders() });
+      return new Response("Not Found", { status: 404, headers: CORS_HEADERS });
     }
 
-    // --- Protected endpoints (require Bearer auth) ---
-
+    // Bearer-auth protected endpoints
     if (!(await authenticate(request, env))) {
       return new Response("Unauthorized", {
         status: 401,
-        headers: {
-          "WWW-Authenticate": "Bearer",
-          ...corsHeaders(),
-        },
+        headers: { "WWW-Authenticate": "Bearer", ...CORS_HEADERS },
       });
     }
 
-    // SSE transport
     if (path === "/sse" && request.method === "GET") {
-      const encoder = new TextEncoder();
-      const baseUrl = url.origin;
-      let keepAliveInterval: ReturnType<typeof setInterval>;
-      const stream = new ReadableStream({
-        start(controller) {
-          controller.enqueue(
-            encoder.encode(`event: endpoint\ndata: ${baseUrl}/message\n\n`),
-          );
-          keepAliveInterval = setInterval(() => {
-            try {
-              controller.enqueue(encoder.encode(`: keepalive\n\n`));
-            } catch {
-              clearInterval(keepAliveInterval);
-            }
-          }, 15000);
-        },
-        cancel() {
-          clearInterval(keepAliveInterval);
-        },
-      });
-      return new Response(stream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-          ...corsHeaders(),
-        },
-      });
+      const stream = createSseStream(`${url.origin}/message`);
+      return new Response(stream, { headers: SSE_HEADERS });
     }
 
-    // POST: /message (SSE), /mcp (Streamable HTTP)
     if (
       (path === "/message" || path === "/mcp") &&
       request.method === "POST"
     ) {
-      const body = await request.json();
-
-      if (Array.isArray(body)) {
-        const responses = await Promise.all(
-          body.map((r: JsonRpcRequest) => processRequest(r, env)),
-        );
-        return Response.json(responses.filter(Boolean), {
-          headers: corsHeaders(),
-        });
-      }
-
-      const response = await processRequest(body as JsonRpcRequest, env);
-      if (!response) {
-        return new Response(null, { status: 204, headers: corsHeaders() });
-      }
-      return Response.json(response, { headers: corsHeaders() });
+      return handleJsonRpcPost(request, env);
     }
 
-    return new Response("Not Found", { status: 404, headers: corsHeaders() });
+    return new Response("Not Found", { status: 404, headers: CORS_HEADERS });
   },
 };
 
-// =====================
-// Durable Object: McpSession
-// Maintains SSE stream so POST responses can be pushed through it
-// =====================
+// --- Durable Object: McpSession ---
+// Maintains SSE stream so POST responses can be pushed through it.
+// Required because SSE transport expects responses delivered via the stream,
+// not as HTTP response bodies — impossible without shared state across requests.
 
 export class McpSession implements DurableObject {
   private sseController: ReadableStreamDefaultController<Uint8Array> | null =
     null;
-  private encoder = new TextEncoder();
   private keepAliveInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -983,53 +905,40 @@ export class McpSession implements DurableObject {
 
     if (url.pathname === "/sse" && request.method === "GET") {
       const messageUrl = url.searchParams.get("messageUrl") || "";
-      const stream = new ReadableStream<Uint8Array>({
-        start: (controller) => {
+      const stream = createSseStream(
+        messageUrl,
+        (controller) => {
           this.sseController = controller;
-          controller.enqueue(
-            this.encoder.encode(`event: endpoint\ndata: ${messageUrl}\n\n`),
-          );
-          this.keepAliveInterval = setInterval(() => {
-            try {
-              controller.enqueue(this.encoder.encode(`: keepalive\n\n`));
-            } catch {
-              this.cleanup();
-            }
-          }, 15000);
         },
-        cancel: () => {
-          this.cleanup();
-        },
-      });
-
-      return new Response(stream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-          "Access-Control-Allow-Origin": "*",
-        },
-      });
+        () => this.cleanup(),
+      );
+      return new Response(stream, { headers: SSE_HEADERS });
     }
 
     if (url.pathname === "/message" && request.method === "POST") {
-      const body = (await request.json()) as JsonRpcRequest;
+      const body = await request.json();
 
-      // Notifications (no id) don't need a response
-      if (body.id === undefined) {
-        return new Response(null, { status: 202 });
+      // Handle batch and single requests
+      const requests = Array.isArray(body) ? body : [body];
+      const responses: JsonRpcResponse[] = [];
+
+      for (const req of requests as JsonRpcRequest[]) {
+        if (req.id === undefined) continue;
+        const response = await processRequest(req, this.env);
+        if (response) responses.push(response);
       }
 
-      const response = await processRequest(body, this.env);
-
-      if (this.sseController && response) {
-        try {
-          const data = JSON.stringify(response);
-          this.sseController.enqueue(
-            this.encoder.encode(`event: message\ndata: ${data}\n\n`),
-          );
-        } catch {
-          // SSE connection already closed
+      if (this.sseController) {
+        for (const response of responses) {
+          try {
+            const data = JSON.stringify(response);
+            this.sseController.enqueue(
+              encoder.encode(`event: message\ndata: ${data}\n\n`),
+            );
+          } catch {
+            this.cleanup();
+            break;
+          }
         }
       }
 
