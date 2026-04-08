@@ -27,6 +27,7 @@ const LAYERS = ["L0", "L1", "L2", "L3"] as const;
 const ACCESS_TOKEN_TTL_S = 30 * 24 * 60 * 60;
 const REFRESH_TOKEN_TTL_S = 90 * 24 * 60 * 60;
 const SSE_KEEPALIVE_MS = 15000;
+const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 const encoder = new TextEncoder();
 
 const CORS_HEADERS: Record<string, string> = {
@@ -801,13 +802,62 @@ async function authenticate(request: Request, env: Env): Promise<boolean> {
 // --- Embedding ---
 
 async function embed(text: string, env: Env): Promise<number[]> {
-  const res = (await env.AI.run("@cf/baai/bge-base-en-v1.5", {
+  const res = (await env.AI.run(EMBEDDING_MODEL, {
     text: [text],
   })) as { data: number[][] };
   return res.data[0];
 }
 
-// --- Tool implementations ---
+async function vectorSearch(
+  query: string,
+  env: Env,
+  opts: { topK?: number; category?: string; extraConditions?: string[]; extraBinds?: unknown[] } = {},
+): Promise<{ results: any[]; scoreMap: Map<string, number> }> {
+  const embedding = await embed(query, env);
+  const filter = opts.category ? { category: opts.category } : undefined;
+  const matches = await env.VECTORIZE.query(embedding, {
+    topK: opts.topK || 20,
+    filter,
+    returnMetadata: "all",
+  });
+  if (!matches.matches.length) return { results: [], scoreMap: new Map() };
+
+  const ids = matches.matches.map((m) => m.id);
+  const placeholders = ids.map(() => "?").join(",");
+  let query2 = `${MEMORY_SELECT} WHERE m.id IN (${placeholders})`;
+  const binds: unknown[] = [...ids];
+
+  if (opts.extraConditions?.length) {
+    query2 += " AND " + opts.extraConditions.join(" AND ");
+    binds.push(...(opts.extraBinds || []));
+  }
+
+  const { results } = await env.DB.prepare(query2).bind(...binds).all();
+  const scoreMap = new Map(matches.matches.map((m) => [m.id, m.score]));
+  return { results: results as any[], scoreMap };
+}
+
+function formatScoredResults(results: any[], scoreMap: Map<string, number>, label: string): string {
+  return results
+    .sort((a, b) => (scoreMap.get(b.id) || 0) - (scoreMap.get(a.id) || 0))
+    .map((r) => formatMemory(r, `${label}: ${(scoreMap.get(r.id) || 0).toFixed(3)}`))
+    .join("\n\n---\n\n");
+}
+
+async function fetchIdentity(env: Env): Promise<any[]> {
+  return (await env.DB.prepare("SELECT key, value FROM identity ORDER BY key").all()).results as any[];
+}
+
+function formatIdentity(rows: any[]): string {
+  if (!rows.length) return "(not set)";
+  return rows.map((r) => `- **${r.key}**: ${r.value}`).join("\n");
+}
+
+async function fetchL1(env: Env, limit: number): Promise<any[]> {
+  return (await env.DB.prepare(
+    `${MEMORY_SELECT} WHERE (m.layer = 'L1' OR m.importance >= 8) ORDER BY m.importance DESC, m.updated_at DESC LIMIT ?`,
+  ).bind(limit).all()).results as any[];
+}
 
 async function memoryStore(
   args: {
@@ -834,14 +884,13 @@ async function memoryStore(
     resolveWingRoom(env, args.wing, args.room, args.wing_type),
   ]);
 
-  await env.DB.prepare(
-    "INSERT INTO memories (id, content, category, tags, wing_id, room_id, hall, is_closet, source_ids, importance, layer, valid_from, valid_to, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-  )
-    .bind(id, args.content, category, tags, wingId, roomId, hall, isCloset, sourceIds, importance, layer, args.valid_from || null, args.valid_to || null, now, now)
-    .run();
-
-  await env.VECTORIZE.upsert([
-    { id, values: embedding, metadata: { category } },
+  await Promise.all([
+    env.DB.prepare(
+      "INSERT INTO memories (id, content, category, tags, wing_id, room_id, hall, is_closet, source_ids, importance, layer, valid_from, valid_to, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+      .bind(id, args.content, category, tags, wingId, roomId, hall, isCloset, sourceIds, importance, layer, args.valid_from || null, args.valid_to || null, now, now)
+      .run(),
+    env.VECTORIZE.upsert([{ id, values: embedding, metadata: { category } }]),
   ]);
 
   const location = [args.wing, args.room].filter(Boolean).join("/");
@@ -853,42 +902,20 @@ async function memorySearch(
   args: { query: string; category?: string; wing?: string; room?: string; hall?: string; as_of?: string; limit?: number },
   env: Env,
 ) {
-  const limit = Math.min(args.limit || 10, 50);
-  const embedding = await embed(args.query, env);
-
-  const filter = args.category ? { category: args.category } : undefined;
-
-  const matches = await env.VECTORIZE.query(embedding, {
-    topK: limit,
-    filter,
-    returnMetadata: "all",
-  });
-
-  if (!matches.matches.length) return textResult("No memories found.");
-
-  const ids = matches.matches.map((m) => m.id);
-  const placeholders = ids.map(() => "?").join(",");
-
-  let query = `${MEMORY_SELECT} WHERE m.id IN (${placeholders})`;
-  const binds: unknown[] = [...ids];
   const conditions: string[] = [];
-
+  const binds: unknown[] = [];
   addPalaceFilters(conditions, binds, args);
   addTemporalFilters(conditions, binds, args);
-  if (conditions.length) query += " AND " + conditions.join(" AND ");
 
-  const { results } = await env.DB.prepare(query).bind(...binds).all();
+  const { results, scoreMap } = await vectorSearch(args.query, env, {
+    topK: Math.min(args.limit || 10, 50),
+    category: args.category,
+    extraConditions: conditions,
+    extraBinds: binds,
+  });
 
-  if (!(results as any[]).length) return textResult("No memories found.");
-
-  const scoreMap = new Map(matches.matches.map((m) => [m.id, m.score]));
-
-  const text = (results as any[])
-    .sort((a, b) => (scoreMap.get(b.id) || 0) - (scoreMap.get(a.id) || 0))
-    .map((r) => formatMemory(r, `relevance: ${(scoreMap.get(r.id) || 0).toFixed(3)}`))
-    .join("\n\n---\n\n");
-
-  return textResult(text);
+  if (!results.length) return textResult("No memories found.");
+  return textResult(formatScoredResults(results, scoreMap, "relevance"));
 }
 
 async function memoryList(
@@ -939,9 +966,12 @@ async function memoryUpdate(
   },
   env: Env,
 ) {
-  const existing = (await env.DB.prepare(
-    "SELECT content, category, tags, hall, importance, layer FROM memories WHERE id = ?",
-  ).bind(args.id).first()) as any;
+  const [existing, { wingId, roomId }] = await Promise.all([
+    env.DB.prepare(
+      "SELECT content, category, tags, hall, importance, layer FROM memories WHERE id = ?",
+    ).bind(args.id).first() as Promise<any>,
+    resolveWingRoom(env, args.wing, args.room),
+  ]);
 
   if (!existing) return textResult(`Memory [${args.id}] not found.`);
 
@@ -952,8 +982,6 @@ async function memoryUpdate(
   const importance = args.importance !== undefined ? clampImportance(args.importance) : (existing.importance || 0);
   const layer = args.layer ? validateLayer(args.layer) : (existing.layer || "L2");
   const now = new Date().toISOString();
-
-  const { wingId, roomId } = await resolveWingRoom(env, args.wing, args.room);
 
   const setClauses = [
     "content = ?", "category = ?", "tags = ?", "hall = ?", "importance = ?", "layer = ?", "updated_at = ?",
@@ -1168,55 +1196,36 @@ async function wakeupContext(
 ) {
   const layer = args.layer || "all";
 
-  // L0: Identity key-value pairs
-  if (layer === "L0" || layer === "all") {
-    const identityRows = (await env.DB.prepare(
-      "SELECT key, value FROM identity ORDER BY key",
-    ).all()).results as any[];
+  if (layer === "L0") {
+    const rows = await fetchIdentity(env);
+    if (!rows.length) return textResult("# L0 Identity\n\nNo identity set. Use identity_manage to set key-value pairs.");
+    return textResult(`# L0 Identity\n\n${formatIdentity(rows)}`);
+  }
 
-    if (layer === "L0") {
-      if (!identityRows.length) return textResult("# L0 Identity\n\nNo identity set. Use identity_manage to set key-value pairs.");
-      const text = identityRows.map((r) => `- **${r.key}**: ${r.value}`).join("\n");
-      return textResult(`# L0 Identity\n\n${text}`);
-    }
-
-    // "all" mode: L0 + L1
+  if (layer === "all") {
     const limit = Math.min(args.limit || 10, 30);
-    const { results } = await env.DB.prepare(
-      `${MEMORY_SELECT} WHERE (m.layer = 'L1' OR m.importance >= 8) ORDER BY m.importance DESC, m.updated_at DESC LIMIT ?`,
-    ).bind(limit).all();
-
-    let text = "# Wake-up Context\n\n## L0 Identity\n";
-    if (identityRows.length) {
-      text += identityRows.map((r) => `- **${r.key}**: ${r.value}`).join("\n");
-    } else {
-      text += "(not set)";
-    }
+    const [identityRows, l1Rows] = await Promise.all([
+      fetchIdentity(env),
+      fetchL1(env, limit),
+    ]);
+    let text = `# Wake-up Context\n\n## L0 Identity\n${formatIdentity(identityRows)}`;
     text += "\n\n## L1 Critical Facts\n\n";
-    text += (results as any[]).length
-      ? (results as any[]).map((r) => formatMemory(r)).join("\n\n---\n\n")
+    text += l1Rows.length
+      ? l1Rows.map((r) => formatMemory(r)).join("\n\n---\n\n")
       : "(no critical facts — set importance >= 8 or layer = L1)";
     return textResult(text);
   }
 
-  // L1: Critical facts only
   if (layer === "L1") {
-    const limit = Math.min(args.limit || 10, 30);
-    const { results } = await env.DB.prepare(
-      `${MEMORY_SELECT} WHERE (m.layer = 'L1' OR m.importance >= 8) ORDER BY m.importance DESC, m.updated_at DESC LIMIT ?`,
-    ).bind(limit).all();
-    return textResult(formatMemoryResults(results as any[], "# L1 Critical Facts"));
+    const rows = await fetchL1(env, Math.min(args.limit || 10, 30));
+    return textResult(formatMemoryResults(rows, "# L1 Critical Facts"));
   }
 
-  // L2: Room recall
   if (layer === "L2") {
-    if (args.query) {
-      return memorySearch({ query: args.query, wing: args.wing, room: args.room, limit: args.limit || 10 }, env);
-    }
+    if (args.query) return memorySearch({ query: args.query, wing: args.wing, room: args.room, limit: args.limit || 10 }, env);
     return memoryList({ wing: args.wing, room: args.room, limit: args.limit || 20 }, env);
   }
 
-  // L3: Deep semantic search
   if (layer === "L3") {
     if (!args.query) return textResult("L3 requires a query for deep semantic search.");
     return memorySearch({ query: args.query, limit: args.limit || 20 }, env);
@@ -1235,10 +1244,9 @@ async function identityManage(
 
   switch (args.action) {
     case "list": {
-      const { results } = await env.DB.prepare("SELECT key, value, updated_at FROM identity ORDER BY key").all();
-      if (!(results as any[]).length) return textResult("No identity set. Use action 'set' to add key-value pairs.");
-      const text = (results as any[]).map((r) => `- **${r.key}**: ${r.value} _(${r.updated_at})_`).join("\n");
-      return textResult(`# L0 Identity\n\n${text}`);
+      const rows = await fetchIdentity(env);
+      if (!rows.length) return textResult("No identity set. Use action 'set' to add key-value pairs.");
+      return textResult(`# L0 Identity\n\n${formatIdentity(rows)}`);
     }
     case "get": {
       if (!args.key) return textResult("Error: key required.");
@@ -1268,54 +1276,58 @@ async function memoryMine(
 ) {
   if (!args.memories?.length) return textResult("No memories to import.");
 
-  const BATCH_SIZE = 100; // Workers AI embedding batch limit
-  const memories = args.memories;
+  const BATCH_SIZE = 100;
+  const memories = args.memories.slice(0, 500); // Cap at 500 to avoid timeouts
   let storedCount = 0;
+
+  // Deduplicate and pre-resolve all unique wing/room combinations
   const wingRoomCache = new Map<string, { wingId: string | null; roomId: string | null }>();
+  const uniqueKeys = [...new Set(memories.map((m) => `${m.wing || ""}/${m.room || ""}`))];
+  const resolveResults = await Promise.all(
+    uniqueKeys.map(async (key) => {
+      const [wing, room] = key.split("/");
+      const r = await resolveWingRoom(env, wing || undefined, room || undefined);
+      return { key, ...r };
+    }),
+  );
+  for (const r of resolveResults) wingRoomCache.set(r.key, r);
 
   for (let i = 0; i < memories.length; i += BATCH_SIZE) {
     const batch = memories.slice(i, i + BATCH_SIZE);
-    const texts = batch.map((m) => m.content);
 
     // Batch embedding
-    const embResult = (await env.AI.run("@cf/baai/bge-base-en-v1.5", { text: texts })) as { data: number[][] };
+    const embResult = (await env.AI.run(EMBEDDING_MODEL, {
+      text: batch.map((m) => m.content),
+    })) as { data: number[][] };
 
-    // Resolve wings/rooms (with cache)
-    const resolved = await Promise.all(
-      batch.map(async (m) => {
-        const cacheKey = `${m.wing || ""}/${m.room || ""}`;
-        if (wingRoomCache.has(cacheKey)) return wingRoomCache.get(cacheKey)!;
-        const r = await resolveWingRoom(env, m.wing, m.room);
-        wingRoomCache.set(cacheKey, r);
-        return r;
-      }),
-    );
-
-    // Batch insert to D1
     const now = new Date().toISOString();
     const ids: string[] = [];
     const statements = batch.map((m, j) => {
       const id = crypto.randomUUID();
       ids.push(id);
+      const cached = wingRoomCache.get(`${m.wing || ""}/${m.room || ""}`)!;
       return env.DB.prepare(
         "INSERT INTO memories (id, content, category, tags, wing_id, room_id, hall, importance, layer, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       ).bind(
         id, m.content, m.category || "general",
         JSON.stringify(m.tags || []),
-        resolved[j].wingId, resolved[j].roomId,
+        cached.wingId, cached.roomId,
         validateHall(m.hall), clampImportance(m.importance),
         validateLayer(m.layer), now, now,
       );
     });
-    await env.DB.batch(statements);
 
-    // Batch upsert to Vectorize
     const vectors = ids.map((id, j) => ({
       id,
       values: embResult.data[j],
       metadata: { category: batch[j].category || "general" },
     }));
-    await env.VECTORIZE.upsert(vectors);
+
+    // D1 + Vectorize in parallel
+    await Promise.all([
+      env.DB.batch(statements),
+      env.VECTORIZE.upsert(vectors),
+    ]);
 
     storedCount += batch.length;
   }
@@ -1329,31 +1341,31 @@ async function memoryTimeline(
   env: Env,
 ) {
   const limit = Math.min(args.limit || 20, 100);
-
-  let query = MEMORY_SELECT;
   const conditions: string[] = [];
   const binds: unknown[] = [];
-
-  // If entity provided, do semantic search first to get relevant IDs
-  if (args.entity) {
-    const embedding = await embed(args.entity, env);
-    const matches = await env.VECTORIZE.query(embedding, { topK: limit * 2, returnMetadata: "all" });
-    if (!matches.matches.length) return textResult("No memories found for this entity.");
-    const ids = matches.matches.map((m) => m.id);
-    const placeholders = ids.map(() => "?").join(",");
-    conditions.push(`m.id IN (${placeholders})`);
-    binds.push(...ids);
-  }
 
   addPalaceFilters(conditions, binds, args);
   addTemporalFilters(conditions, binds, args);
 
-  if (conditions.length) query += " WHERE " + conditions.join(" AND ");
-  query += " ORDER BY COALESCE(m.valid_from, m.created_at) ASC LIMIT ?";
-  binds.push(limit);
+  let rows: any[];
 
-  const { results } = await env.DB.prepare(query).bind(...binds).all();
-  const rows = results as any[];
+  if (args.entity) {
+    const { results } = await vectorSearch(args.entity, env, {
+      topK: limit * 2,
+      extraConditions: conditions,
+      extraBinds: binds,
+    });
+    // Re-sort by time for timeline view
+    rows = results.sort((a, b) =>
+      (a.valid_from || a.created_at).localeCompare(b.valid_from || b.created_at),
+    ).slice(0, limit);
+  } else {
+    let query = MEMORY_SELECT;
+    if (conditions.length) query += " WHERE " + conditions.join(" AND ");
+    query += " ORDER BY COALESCE(m.valid_from, m.created_at) ASC LIMIT ?";
+    binds.push(limit);
+    rows = (await env.DB.prepare(query).bind(...binds).all()).results as any[];
+  }
 
   if (!rows.length) return textResult("No memories found in this timeline.");
 
@@ -1373,29 +1385,16 @@ async function contradictionCheck(
   const threshold = args.threshold || 0.7;
   const limit = Math.min(args.limit || 5, 20);
 
-  const embedding = await embed(args.content, env);
-  const matches = await env.VECTORIZE.query(embedding, { topK: limit * 2, returnMetadata: "all" });
+  const { results, scoreMap } = await vectorSearch(args.content, env, { topK: limit * 2 });
 
-  const candidates = matches.matches.filter((m) => (m.score || 0) >= threshold).slice(0, limit);
+  const filtered = results.filter((r) => (scoreMap.get(r.id) || 0) >= threshold).slice(0, limit);
 
-  if (!candidates.length) {
+  if (!filtered.length) {
     return textResult(`No similar memories found above threshold ${threshold}. No potential contradictions.`);
   }
 
-  const ids = candidates.map((m) => m.id);
-  const placeholders = ids.map(() => "?").join(",");
-  const { results } = await env.DB.prepare(
-    `${MEMORY_SELECT} WHERE m.id IN (${placeholders})`,
-  ).bind(...ids).all();
-
-  const scoreMap = new Map(candidates.map((m) => [m.id, m.score]));
-
-  const text = (results as any[])
-    .sort((a, b) => (scoreMap.get(b.id) || 0) - (scoreMap.get(a.id) || 0))
-    .map((r) => formatMemory(r, `similarity: ${(scoreMap.get(r.id) || 0).toFixed(3)}`))
-    .join("\n\n---\n\n");
-
-  return textResult(`# Contradiction Check\n\n**Statement:** ${args.content}\n**Threshold:** ${threshold}\n**Candidates:** ${candidates.length}\n\nReview these similar memories for potential conflicts:\n\n${text}`);
+  const text = formatScoredResults(filtered, scoreMap, "similarity");
+  return textResult(`# Contradiction Check\n\n**Statement:** ${args.content}\n**Threshold:** ${threshold}\n**Candidates:** ${filtered.length}\n\nReview these similar memories for potential conflicts:\n\n${text}`);
 }
 
 async function agentManage(
@@ -1407,18 +1406,16 @@ async function agentManage(
   switch (args.action) {
     case "create": {
       if (!args.name || !args.focus) return textResult("Error: name and focus required.");
-      const existing = await env.DB.prepare("SELECT id FROM agents WHERE name = ?").bind(args.name).first();
+      const [existing, resolved] = await Promise.all([
+        env.DB.prepare("SELECT id FROM agents WHERE name = ?").bind(args.name).first(),
+        args.wing ? resolveWingRoom(env, args.wing) : Promise.resolve({ wingId: null }),
+      ]);
       if (existing) return textResult(`Agent "${args.name}" already exists.`);
 
       const id = crypto.randomUUID();
-      let wingId: string | null = null;
-      if (args.wing) {
-        const resolved = await resolveWingRoom(env, args.wing);
-        wingId = resolved.wingId;
-      }
       await env.DB.prepare(
         "INSERT INTO agents (id, name, wing_id, focus, created_at) VALUES (?, ?, ?, ?, ?)",
-      ).bind(id, args.name, wingId, args.focus, now).run();
+      ).bind(id, args.name, resolved.wingId, args.focus, now).run();
       return textResult(`Created agent "${args.name}" (focus: ${args.focus}) [${id}]`);
     }
     case "list": {
@@ -1444,22 +1441,22 @@ async function agentManage(
     case "diary_read": {
       if (!args.agent_id) return textResult("Error: agent_id required.");
       const limit = Math.min(args.limit || 10, 50);
-      const agent = (await env.DB.prepare("SELECT name, focus FROM agents WHERE id = ?").bind(args.agent_id).first()) as any;
+      const [agent, { results }] = await Promise.all([
+        env.DB.prepare("SELECT name, focus FROM agents WHERE id = ?").bind(args.agent_id).first() as Promise<any>,
+        env.DB.prepare(
+          "SELECT * FROM diary_entries WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
+        ).bind(args.agent_id, limit).all(),
+      ]);
       if (!agent) return textResult(`Agent [${args.agent_id}] not found.`);
-      const { results } = await env.DB.prepare(
-        "SELECT * FROM diary_entries WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
-      ).bind(args.agent_id, limit).all();
       if (!(results as any[]).length) return textResult(`Agent "${agent.name}" has no diary entries.`);
       const text = (results as any[]).map((d) =>
         `**[${d.created_at}]**\n${d.content}`,
       ).join("\n\n---\n\n");
       return textResult(`# Diary: ${agent.name} (${agent.focus})\n\n${text}`);
     }
-    case "delete": {
+    case "delete":
       if (!args.agent_id) return textResult("Error: agent_id required.");
-      const result = await env.DB.prepare("DELETE FROM agents WHERE id = ?").bind(args.agent_id).run();
-      return result.meta.changes ? textResult("Deleted agent and diary entries.") : textResult("Agent not found.");
-    }
+      return deleteEntity(env, "agents", "id = ?", args.agent_id);
     default:
       return textResult(`Unknown action: ${args.action}`);
   }
