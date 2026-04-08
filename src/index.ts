@@ -23,6 +23,7 @@ interface JsonRpcResponse {
 const SERVER_INFO = { name: "memory-mcp-server", version: "2.0.0" };
 const HALLS = ["facts", "events", "discoveries", "preferences", "advice"] as const;
 const WING_TYPES = ["person", "project"] as const;
+const LAYERS = ["L0", "L1", "L2", "L3"] as const;
 const ACCESS_TOKEN_TTL_S = 30 * 24 * 60 * 60;
 const REFRESH_TOKEN_TTL_S = 90 * 24 * 60 * 60;
 const SSE_KEEPALIVE_MS = 15000;
@@ -69,6 +70,9 @@ const TOOLS = [
           enum: ["facts", "events", "discoveries", "preferences", "advice"],
         },
         importance: { type: "number", description: "Importance 0-10 for wake-up context priority (default 0)" },
+        layer: { type: "string", description: "Memory tier: L0 (identity), L1 (critical), L2 (room recall, default), L3 (deep search)", enum: ["L0", "L1", "L2", "L3"] },
+        valid_from: { type: "string", description: "When this fact became true (ISO timestamp)" },
+        valid_to: { type: "string", description: "When this fact stopped being true (ISO timestamp)" },
       },
       required: ["content"],
     },
@@ -85,6 +89,7 @@ const TOOLS = [
         wing: { type: "string", description: "Filter by wing name" },
         room: { type: "string", description: "Filter by room name" },
         hall: { type: "string", description: "Filter by hall type" },
+        as_of: { type: "string", description: "Show only memories valid at this timestamp (ISO)" },
         limit: { type: "number", description: "Max results (default 10)" },
       },
       required: ["query"],
@@ -101,6 +106,8 @@ const TOOLS = [
         wing: { type: "string", description: "Filter by wing name" },
         room: { type: "string", description: "Filter by room name" },
         hall: { type: "string", description: "Filter by hall type" },
+        layer: { type: "string", description: "Filter by memory tier", enum: ["L0", "L1", "L2", "L3"] },
+        as_of: { type: "string", description: "Show only memories valid at this timestamp (ISO)" },
         limit: { type: "number", description: "Max results (default 20)" },
         offset: { type: "number", description: "Pagination offset" },
       },
@@ -131,6 +138,9 @@ const TOOLS = [
         room: { type: "string", description: "Move to room (auto-created if new, requires wing)" },
         hall: { type: "string", description: "Change hall type", enum: ["facts", "events", "discoveries", "preferences", "advice"] },
         importance: { type: "number", description: "Set importance 0-10" },
+        layer: { type: "string", description: "Set memory tier", enum: ["L0", "L1", "L2", "L3"] },
+        valid_from: { type: "string", description: "When this fact became true (ISO)" },
+        valid_to: { type: "string", description: "When this fact stopped being true (ISO)" },
       },
       required: ["id"],
     },
@@ -191,12 +201,102 @@ const TOOLS = [
   },
   {
     name: "wakeup_context",
-    description: "Get the most important memories for session start. Returns high-importance memories across all wings, providing essential context to resume work effectively.",
+    description: "Get context for session start. Supports layered loading: L0 (identity, ~50 tokens), L1 (critical facts), L2 (room recall), L3 (deep search). Default returns L0+L1.",
     inputSchema: {
       type: "object",
       properties: {
-        limit: { type: "number", description: "Max memories to return (default 10)" },
+        layer: { type: "string", description: "Layer to load: L0, L1, L2, L3, or 'all' (default: all = L0+L1)", enum: ["L0", "L1", "L2", "L3", "all"] },
+        query: { type: "string", description: "Semantic query (for L2/L3)" },
+        wing: { type: "string", description: "Filter by wing (for L2)" },
+        room: { type: "string", description: "Filter by room (for L2)" },
+        limit: { type: "number", description: "Max memories to return (default varies by layer)" },
       },
+    },
+  },
+  {
+    name: "identity_manage",
+    description: "Manage L0 identity — core key-value pairs about the user (name, role, language, timezone, etc.). Always loaded at session start.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", description: "Action to perform", enum: ["get", "set", "delete", "list"] },
+        key: { type: "string", description: "Identity key (e.g. 'name', 'role', 'language')" },
+        value: { type: "string", description: "Value to set (for 'set' action)" },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    name: "memory_mine",
+    description: "Batch import multiple memories at once. Accepts an array of memories, generates embeddings in bulk, and stores them efficiently.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        memories: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              content: { type: "string" },
+              category: { type: "string" },
+              tags: { type: "array", items: { type: "string" } },
+              wing: { type: "string" },
+              room: { type: "string" },
+              hall: { type: "string" },
+              importance: { type: "number" },
+              layer: { type: "string" },
+            },
+            required: ["content"],
+          },
+        },
+      },
+      required: ["memories"],
+    },
+  },
+  {
+    name: "memory_timeline",
+    description: "Query the temporal knowledge graph. Get a timeline of memories about an entity, or snapshot what was known at a specific point in time.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        entity: { type: "string", description: "Semantic search for entity/topic" },
+        as_of: { type: "string", description: "Show what was valid at this timestamp (ISO)" },
+        from: { type: "string", description: "Range start (ISO timestamp)" },
+        to: { type: "string", description: "Range end (ISO timestamp)" },
+        wing: { type: "string", description: "Filter by wing" },
+        room: { type: "string", description: "Filter by room" },
+        limit: { type: "number", description: "Max results (default 20)" },
+      },
+    },
+  },
+  {
+    name: "contradiction_check",
+    description: "Search for memories that might contradict a given statement. Returns semantically similar memories for the caller to evaluate potential conflicts.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "Statement to check for contradictions" },
+        threshold: { type: "number", description: "Similarity threshold 0-1 (default 0.7)" },
+        limit: { type: "number", description: "Max candidates to return (default 5)" },
+      },
+      required: ["content"],
+    },
+  },
+  {
+    name: "agent_manage",
+    description: "Manage specialist agents — each agent has its own wing, focus area, and persistent diary. Agents accumulate expertise over time.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", description: "Action", enum: ["create", "delete", "list", "diary_add", "diary_read"] },
+        name: { type: "string", description: "Agent name (for create)" },
+        focus: { type: "string", description: "Agent specialty (for create)" },
+        wing: { type: "string", description: "Assign to wing (for create, auto-created)" },
+        agent_id: { type: "string", description: "Agent ID (for delete, diary_add, diary_read)" },
+        content: { type: "string", description: "Diary entry content (for diary_add)" },
+        limit: { type: "number", description: "Max diary entries (default 10, for diary_read)" },
+      },
+      required: ["action"],
     },
   },
 ];
@@ -214,9 +314,36 @@ function validateHall(hall?: string): string {
   return hall || "facts";
 }
 
+function validateLayer(layer?: string): string {
+  if (layer && !(LAYERS as readonly string[]).includes(layer)) return "L2";
+  return layer || "L2";
+}
+
+function addTemporalFilters(
+  conditions: string[],
+  binds: unknown[],
+  args: { as_of?: string; from?: string; to?: string },
+) {
+  if (args.as_of) {
+    conditions.push("(m.valid_from IS NULL OR m.valid_from <= ?)");
+    binds.push(args.as_of);
+    conditions.push("(m.valid_to IS NULL OR m.valid_to > ?)");
+    binds.push(args.as_of);
+  }
+  if (args.from) {
+    conditions.push("(m.valid_to IS NULL OR m.valid_to >= ?)");
+    binds.push(args.from);
+  }
+  if (args.to) {
+    conditions.push("(m.valid_from IS NULL OR m.valid_from <= ?)");
+    binds.push(args.to);
+  }
+}
+
 function formatMemory(r: any, extra?: string): string {
   const tags = JSON.parse(r.tags || "[]").join(", ") || "none";
-  const parts = [extra, r.category, r.hall].filter(Boolean).join(", ");
+  const layer = r.layer && r.layer !== "L2" ? `${r.layer}` : "";
+  const parts = [extra, layer, r.category, r.hall].filter(Boolean).join(", ");
   const location = [r.wing_name, r.room_name].filter(Boolean).join("/");
   const closetFlag = r.is_closet ? " [closet]" : "";
   const impFlag = r.importance > 0 ? ` imp:${r.importance}` : "";
@@ -225,6 +352,9 @@ function formatMemory(r: any, extra?: string): string {
   text += `\n${r.content}\nTags: ${tags} | Created: ${r.created_at}`;
   if (r.updated_at && r.updated_at !== r.created_at) {
     text += `\nUpdated: ${r.updated_at}`;
+  }
+  if (r.valid_from || r.valid_to) {
+    text += `\nValid: ${r.valid_from || "∞"} → ${r.valid_to || "present"}`;
   }
   return text;
 }
@@ -684,6 +814,7 @@ async function memoryStore(
     content: string; category?: string; tags?: string[];
     wing?: string; wing_type?: string; room?: string;
     hall?: string; importance?: number;
+    layer?: string; valid_from?: string; valid_to?: string;
     _isCloset?: boolean; _sourceIds?: string[];
   },
   env: Env,
@@ -693,6 +824,7 @@ async function memoryStore(
   const tags = JSON.stringify(args.tags || []);
   const hall = validateHall(args.hall);
   const importance = args._isCloset ? clampImportance(args.importance || 5) : clampImportance(args.importance);
+  const layer = validateLayer(args.layer);
   const isCloset = args._isCloset ? 1 : 0;
   const sourceIds = JSON.stringify(args._sourceIds || []);
   const now = new Date().toISOString();
@@ -703,9 +835,9 @@ async function memoryStore(
   ]);
 
   await env.DB.prepare(
-    "INSERT INTO memories (id, content, category, tags, wing_id, room_id, hall, is_closet, source_ids, importance, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO memories (id, content, category, tags, wing_id, room_id, hall, is_closet, source_ids, importance, layer, valid_from, valid_to, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   )
-    .bind(id, args.content, category, tags, wingId, roomId, hall, isCloset, sourceIds, importance, now, now)
+    .bind(id, args.content, category, tags, wingId, roomId, hall, isCloset, sourceIds, importance, layer, args.valid_from || null, args.valid_to || null, now, now)
     .run();
 
   await env.VECTORIZE.upsert([
@@ -714,11 +846,11 @@ async function memoryStore(
 
   const location = [args.wing, args.room].filter(Boolean).join("/");
   const label = args._isCloset ? "closet" : "memory";
-  return textResult(`Stored ${label} [${id}] in ${category}/${hall}${location ? ` 📍${location}` : ""}${importance > 0 ? ` (importance: ${importance})` : ""}`);
+  return textResult(`Stored ${label} [${id}] in ${category}/${hall}/${layer}${location ? ` 📍${location}` : ""}${importance > 0 ? ` (importance: ${importance})` : ""}`);
 }
 
 async function memorySearch(
-  args: { query: string; category?: string; wing?: string; room?: string; hall?: string; limit?: number },
+  args: { query: string; category?: string; wing?: string; room?: string; hall?: string; as_of?: string; limit?: number },
   env: Env,
 ) {
   const limit = Math.min(args.limit || 10, 50);
@@ -742,6 +874,7 @@ async function memorySearch(
   const conditions: string[] = [];
 
   addPalaceFilters(conditions, binds, args);
+  addTemporalFilters(conditions, binds, args);
   if (conditions.length) query += " AND " + conditions.join(" AND ");
 
   const { results } = await env.DB.prepare(query).bind(...binds).all();
@@ -759,7 +892,7 @@ async function memorySearch(
 }
 
 async function memoryList(
-  args: { category?: string; tag?: string; wing?: string; room?: string; hall?: string; limit?: number; offset?: number },
+  args: { category?: string; tag?: string; wing?: string; room?: string; hall?: string; layer?: string; as_of?: string; limit?: number; offset?: number },
   env: Env,
 ) {
   const limit = Math.min(args.limit || 20, 100);
@@ -771,7 +904,9 @@ async function memoryList(
 
   if (args.category) { conditions.push("m.category = ?"); binds.push(args.category); }
   if (args.tag) { conditions.push("m.tags LIKE ?"); binds.push(`%"${args.tag}"%`); }
+  if (args.layer) { conditions.push("m.layer = ?"); binds.push(args.layer); }
   addPalaceFilters(conditions, binds, args);
+  addTemporalFilters(conditions, binds, args);
 
   if (conditions.length) query += " WHERE " + conditions.join(" AND ");
   query += " ORDER BY m.importance DESC, m.created_at DESC LIMIT ? OFFSET ?";
@@ -800,11 +935,12 @@ async function memoryUpdate(
   args: {
     id: string; content?: string; category?: string; tags?: string[];
     wing?: string; room?: string; hall?: string; importance?: number;
+    layer?: string; valid_from?: string; valid_to?: string;
   },
   env: Env,
 ) {
   const existing = (await env.DB.prepare(
-    "SELECT content, category, tags, hall, importance FROM memories WHERE id = ?",
+    "SELECT content, category, tags, hall, importance, layer FROM memories WHERE id = ?",
   ).bind(args.id).first()) as any;
 
   if (!existing) return textResult(`Memory [${args.id}] not found.`);
@@ -814,17 +950,20 @@ async function memoryUpdate(
   const tags = args.tags ? JSON.stringify(args.tags) : existing.tags;
   const hall = validateHall(args.hall || existing.hall);
   const importance = args.importance !== undefined ? clampImportance(args.importance) : (existing.importance || 0);
+  const layer = args.layer ? validateLayer(args.layer) : (existing.layer || "L2");
   const now = new Date().toISOString();
 
   const { wingId, roomId } = await resolveWingRoom(env, args.wing, args.room);
 
   const setClauses = [
-    "content = ?", "category = ?", "tags = ?", "hall = ?", "importance = ?", "updated_at = ?",
+    "content = ?", "category = ?", "tags = ?", "hall = ?", "importance = ?", "layer = ?", "updated_at = ?",
   ];
-  const setBinds: unknown[] = [content, category, tags, hall, importance, now];
+  const setBinds: unknown[] = [content, category, tags, hall, importance, layer, now];
 
   if (wingId !== null) { setClauses.push("wing_id = ?"); setBinds.push(wingId); }
   if (roomId !== null) { setClauses.push("room_id = ?"); setBinds.push(roomId); }
+  if (args.valid_from !== undefined) { setClauses.push("valid_from = ?"); setBinds.push(args.valid_from || null); }
+  if (args.valid_to !== undefined) { setClauses.push("valid_to = ?"); setBinds.push(args.valid_to || null); }
 
   setBinds.push(args.id);
 
@@ -1023,18 +1162,307 @@ async function closetCreate(
   );
 }
 
-async function wakeupContext(args: { limit?: number }, env: Env) {
-  const limit = Math.min(args.limit || 10, 30);
+async function wakeupContext(
+  args: { layer?: string; query?: string; wing?: string; room?: string; limit?: number },
+  env: Env,
+) {
+  const layer = args.layer || "all";
 
-  // Single query: important first, then recent as fallback
-  const { results } = await env.DB.prepare(
-    `${MEMORY_SELECT} ORDER BY m.importance DESC, m.updated_at DESC LIMIT ?`,
-  ).bind(limit).all();
+  // L0: Identity key-value pairs
+  if (layer === "L0" || layer === "all") {
+    const identityRows = (await env.DB.prepare(
+      "SELECT key, value FROM identity ORDER BY key",
+    ).all()).results as any[];
 
+    if (layer === "L0") {
+      if (!identityRows.length) return textResult("# L0 Identity\n\nNo identity set. Use identity_manage to set key-value pairs.");
+      const text = identityRows.map((r) => `- **${r.key}**: ${r.value}`).join("\n");
+      return textResult(`# L0 Identity\n\n${text}`);
+    }
+
+    // "all" mode: L0 + L1
+    const limit = Math.min(args.limit || 10, 30);
+    const { results } = await env.DB.prepare(
+      `${MEMORY_SELECT} WHERE (m.layer = 'L1' OR m.importance >= 8) ORDER BY m.importance DESC, m.updated_at DESC LIMIT ?`,
+    ).bind(limit).all();
+
+    let text = "# Wake-up Context\n\n## L0 Identity\n";
+    if (identityRows.length) {
+      text += identityRows.map((r) => `- **${r.key}**: ${r.value}`).join("\n");
+    } else {
+      text += "(not set)";
+    }
+    text += "\n\n## L1 Critical Facts\n\n";
+    text += (results as any[]).length
+      ? (results as any[]).map((r) => formatMemory(r)).join("\n\n---\n\n")
+      : "(no critical facts — set importance >= 8 or layer = L1)";
+    return textResult(text);
+  }
+
+  // L1: Critical facts only
+  if (layer === "L1") {
+    const limit = Math.min(args.limit || 10, 30);
+    const { results } = await env.DB.prepare(
+      `${MEMORY_SELECT} WHERE (m.layer = 'L1' OR m.importance >= 8) ORDER BY m.importance DESC, m.updated_at DESC LIMIT ?`,
+    ).bind(limit).all();
+    return textResult(formatMemoryResults(results as any[], "# L1 Critical Facts"));
+  }
+
+  // L2: Room recall
+  if (layer === "L2") {
+    if (args.query) {
+      return memorySearch({ query: args.query, wing: args.wing, room: args.room, limit: args.limit || 10 }, env);
+    }
+    return memoryList({ wing: args.wing, room: args.room, limit: args.limit || 20 }, env);
+  }
+
+  // L3: Deep semantic search
+  if (layer === "L3") {
+    if (!args.query) return textResult("L3 requires a query for deep semantic search.");
+    return memorySearch({ query: args.query, limit: args.limit || 20 }, env);
+  }
+
+  return textResult("Unknown layer. Use: L0, L1, L2, L3, or all.");
+}
+
+// --- New tools: Identity, Mine, Timeline, Contradiction, Agents ---
+
+async function identityManage(
+  args: { action: string; key?: string; value?: string },
+  env: Env,
+) {
+  const now = new Date().toISOString();
+
+  switch (args.action) {
+    case "list": {
+      const { results } = await env.DB.prepare("SELECT key, value, updated_at FROM identity ORDER BY key").all();
+      if (!(results as any[]).length) return textResult("No identity set. Use action 'set' to add key-value pairs.");
+      const text = (results as any[]).map((r) => `- **${r.key}**: ${r.value} _(${r.updated_at})_`).join("\n");
+      return textResult(`# L0 Identity\n\n${text}`);
+    }
+    case "get": {
+      if (!args.key) return textResult("Error: key required.");
+      const row = await env.DB.prepare("SELECT value FROM identity WHERE key = ?").bind(args.key).first() as any;
+      return row ? textResult(`**${args.key}**: ${row.value}`) : textResult(`Key "${args.key}" not found.`);
+    }
+    case "set": {
+      if (!args.key || !args.value) return textResult("Error: key and value required.");
+      await env.DB.prepare(
+        "INSERT INTO identity (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?",
+      ).bind(args.key, args.value, now, args.value, now).run();
+      return textResult(`Set identity: **${args.key}** = ${args.value}`);
+    }
+    case "delete": {
+      if (!args.key) return textResult("Error: key required.");
+      const result = await env.DB.prepare("DELETE FROM identity WHERE key = ?").bind(args.key).run();
+      return result.meta.changes ? textResult(`Deleted identity key "${args.key}".`) : textResult(`Key "${args.key}" not found.`);
+    }
+    default:
+      return textResult(`Unknown action: ${args.action}`);
+  }
+}
+
+async function memoryMine(
+  args: { memories: Array<{ content: string; category?: string; tags?: string[]; wing?: string; room?: string; hall?: string; importance?: number; layer?: string }> },
+  env: Env,
+) {
+  if (!args.memories?.length) return textResult("No memories to import.");
+
+  const BATCH_SIZE = 100; // Workers AI embedding batch limit
+  const memories = args.memories;
+  let storedCount = 0;
+  const wingRoomCache = new Map<string, { wingId: string | null; roomId: string | null }>();
+
+  for (let i = 0; i < memories.length; i += BATCH_SIZE) {
+    const batch = memories.slice(i, i + BATCH_SIZE);
+    const texts = batch.map((m) => m.content);
+
+    // Batch embedding
+    const embResult = (await env.AI.run("@cf/baai/bge-base-en-v1.5", { text: texts })) as { data: number[][] };
+
+    // Resolve wings/rooms (with cache)
+    const resolved = await Promise.all(
+      batch.map(async (m) => {
+        const cacheKey = `${m.wing || ""}/${m.room || ""}`;
+        if (wingRoomCache.has(cacheKey)) return wingRoomCache.get(cacheKey)!;
+        const r = await resolveWingRoom(env, m.wing, m.room);
+        wingRoomCache.set(cacheKey, r);
+        return r;
+      }),
+    );
+
+    // Batch insert to D1
+    const now = new Date().toISOString();
+    const ids: string[] = [];
+    const statements = batch.map((m, j) => {
+      const id = crypto.randomUUID();
+      ids.push(id);
+      return env.DB.prepare(
+        "INSERT INTO memories (id, content, category, tags, wing_id, room_id, hall, importance, layer, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).bind(
+        id, m.content, m.category || "general",
+        JSON.stringify(m.tags || []),
+        resolved[j].wingId, resolved[j].roomId,
+        validateHall(m.hall), clampImportance(m.importance),
+        validateLayer(m.layer), now, now,
+      );
+    });
+    await env.DB.batch(statements);
+
+    // Batch upsert to Vectorize
+    const vectors = ids.map((id, j) => ({
+      id,
+      values: embResult.data[j],
+      metadata: { category: batch[j].category || "general" },
+    }));
+    await env.VECTORIZE.upsert(vectors);
+
+    storedCount += batch.length;
+  }
+
+  const wings = new Set(memories.map((m) => m.wing).filter(Boolean));
+  return textResult(`Mined ${storedCount} memories (${wings.size} wings referenced).`);
+}
+
+async function memoryTimeline(
+  args: { entity?: string; as_of?: string; from?: string; to?: string; wing?: string; room?: string; limit?: number },
+  env: Env,
+) {
+  const limit = Math.min(args.limit || 20, 100);
+
+  let query = MEMORY_SELECT;
+  const conditions: string[] = [];
+  const binds: unknown[] = [];
+
+  // If entity provided, do semantic search first to get relevant IDs
+  if (args.entity) {
+    const embedding = await embed(args.entity, env);
+    const matches = await env.VECTORIZE.query(embedding, { topK: limit * 2, returnMetadata: "all" });
+    if (!matches.matches.length) return textResult("No memories found for this entity.");
+    const ids = matches.matches.map((m) => m.id);
+    const placeholders = ids.map(() => "?").join(",");
+    conditions.push(`m.id IN (${placeholders})`);
+    binds.push(...ids);
+  }
+
+  addPalaceFilters(conditions, binds, args);
+  addTemporalFilters(conditions, binds, args);
+
+  if (conditions.length) query += " WHERE " + conditions.join(" AND ");
+  query += " ORDER BY COALESCE(m.valid_from, m.created_at) ASC LIMIT ?";
+  binds.push(limit);
+
+  const { results } = await env.DB.prepare(query).bind(...binds).all();
   const rows = results as any[];
-  const hasImportant = rows.some((r) => r.importance > 0);
-  const header = hasImportant ? "# Wake-up Context" : "# Wake-up Context (recent, no importance set)";
+
+  if (!rows.length) return textResult("No memories found in this timeline.");
+
+  const header = args.as_of
+    ? `# Timeline (as of ${args.as_of})`
+    : args.from || args.to
+      ? `# Timeline (${args.from || "∞"} → ${args.to || "present"})`
+      : "# Timeline";
+
   return textResult(formatMemoryResults(rows, header));
+}
+
+async function contradictionCheck(
+  args: { content: string; threshold?: number; limit?: number },
+  env: Env,
+) {
+  const threshold = args.threshold || 0.7;
+  const limit = Math.min(args.limit || 5, 20);
+
+  const embedding = await embed(args.content, env);
+  const matches = await env.VECTORIZE.query(embedding, { topK: limit * 2, returnMetadata: "all" });
+
+  const candidates = matches.matches.filter((m) => (m.score || 0) >= threshold).slice(0, limit);
+
+  if (!candidates.length) {
+    return textResult(`No similar memories found above threshold ${threshold}. No potential contradictions.`);
+  }
+
+  const ids = candidates.map((m) => m.id);
+  const placeholders = ids.map(() => "?").join(",");
+  const { results } = await env.DB.prepare(
+    `${MEMORY_SELECT} WHERE m.id IN (${placeholders})`,
+  ).bind(...ids).all();
+
+  const scoreMap = new Map(candidates.map((m) => [m.id, m.score]));
+
+  const text = (results as any[])
+    .sort((a, b) => (scoreMap.get(b.id) || 0) - (scoreMap.get(a.id) || 0))
+    .map((r) => formatMemory(r, `similarity: ${(scoreMap.get(r.id) || 0).toFixed(3)}`))
+    .join("\n\n---\n\n");
+
+  return textResult(`# Contradiction Check\n\n**Statement:** ${args.content}\n**Threshold:** ${threshold}\n**Candidates:** ${candidates.length}\n\nReview these similar memories for potential conflicts:\n\n${text}`);
+}
+
+async function agentManage(
+  args: { action: string; name?: string; focus?: string; wing?: string; agent_id?: string; content?: string; limit?: number },
+  env: Env,
+) {
+  const now = new Date().toISOString();
+
+  switch (args.action) {
+    case "create": {
+      if (!args.name || !args.focus) return textResult("Error: name and focus required.");
+      const existing = await env.DB.prepare("SELECT id FROM agents WHERE name = ?").bind(args.name).first();
+      if (existing) return textResult(`Agent "${args.name}" already exists.`);
+
+      const id = crypto.randomUUID();
+      let wingId: string | null = null;
+      if (args.wing) {
+        const resolved = await resolveWingRoom(env, args.wing);
+        wingId = resolved.wingId;
+      }
+      await env.DB.prepare(
+        "INSERT INTO agents (id, name, wing_id, focus, created_at) VALUES (?, ?, ?, ?, ?)",
+      ).bind(id, args.name, wingId, args.focus, now).run();
+      return textResult(`Created agent "${args.name}" (focus: ${args.focus}) [${id}]`);
+    }
+    case "list": {
+      const { results } = await env.DB.prepare(
+        "SELECT a.*, w.name as wing_name, (SELECT COUNT(*) FROM diary_entries WHERE agent_id = a.id) as diary_count FROM agents a LEFT JOIN wings w ON a.wing_id = w.id ORDER BY a.name",
+      ).all();
+      if (!(results as any[]).length) return textResult("No agents. Use action 'create' to add one.");
+      const text = (results as any[]).map((a) =>
+        `- **${a.name}** [${a.id}] — focus: ${a.focus}${a.wing_name ? ` | wing: ${a.wing_name}` : ""} | diary: ${a.diary_count} entries`,
+      ).join("\n");
+      return textResult(`# Specialist Agents\n\n${text}`);
+    }
+    case "diary_add": {
+      if (!args.agent_id || !args.content) return textResult("Error: agent_id and content required.");
+      const agent = await env.DB.prepare("SELECT id FROM agents WHERE id = ?").bind(args.agent_id).first();
+      if (!agent) return textResult(`Agent [${args.agent_id}] not found.`);
+      const id = crypto.randomUUID();
+      await env.DB.prepare(
+        "INSERT INTO diary_entries (id, agent_id, content, created_at) VALUES (?, ?, ?, ?)",
+      ).bind(id, args.agent_id, args.content, now).run();
+      return textResult(`Added diary entry [${id}] for agent [${args.agent_id}]`);
+    }
+    case "diary_read": {
+      if (!args.agent_id) return textResult("Error: agent_id required.");
+      const limit = Math.min(args.limit || 10, 50);
+      const agent = (await env.DB.prepare("SELECT name, focus FROM agents WHERE id = ?").bind(args.agent_id).first()) as any;
+      if (!agent) return textResult(`Agent [${args.agent_id}] not found.`);
+      const { results } = await env.DB.prepare(
+        "SELECT * FROM diary_entries WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
+      ).bind(args.agent_id, limit).all();
+      if (!(results as any[]).length) return textResult(`Agent "${agent.name}" has no diary entries.`);
+      const text = (results as any[]).map((d) =>
+        `**[${d.created_at}]**\n${d.content}`,
+      ).join("\n\n---\n\n");
+      return textResult(`# Diary: ${agent.name} (${agent.focus})\n\n${text}`);
+    }
+    case "delete": {
+      if (!args.agent_id) return textResult("Error: agent_id required.");
+      const result = await env.DB.prepare("DELETE FROM agents WHERE id = ?").bind(args.agent_id).run();
+      return result.meta.changes ? textResult("Deleted agent and diary entries.") : textResult("Agent not found.");
+    }
+    default:
+      return textResult(`Unknown action: ${args.action}`);
+  }
 }
 
 // --- Tool dispatcher ---
@@ -1061,6 +1489,16 @@ async function callTool(name: string, args: Record<string, unknown>, env: Env) {
       return closetCreate(args as any, env);
     case "wakeup_context":
       return wakeupContext(args as any, env);
+    case "identity_manage":
+      return identityManage(args as any, env);
+    case "memory_mine":
+      return memoryMine(args as any, env);
+    case "memory_timeline":
+      return memoryTimeline(args as any, env);
+    case "contradiction_check":
+      return contradictionCheck(args as any, env);
+    case "agent_manage":
+      return agentManage(args as any, env);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
