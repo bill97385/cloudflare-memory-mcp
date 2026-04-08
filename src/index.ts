@@ -117,6 +117,15 @@ const TOOLS = [
 // OAuth 2.0 + PKCE
 // =====================
 
+function protectedResourceMetadata(origin: string) {
+  return {
+    resource: origin,
+    authorization_servers: [origin],
+    scopes_supported: ["mcp"],
+    bearer_methods_supported: ["header"],
+  };
+}
+
 function oauthMetadata(origin: string) {
   return {
     issuer: origin,
@@ -420,18 +429,20 @@ async function handleToken(request: Request, env: Env): Promise<Response> {
   );
 }
 
-// Dynamic client registration (simplified - accepts any registration)
+// Dynamic client registration (RFC 7591)
 async function handleRegister(request: Request): Promise<Response> {
   const body = (await request.json()) as Record<string, unknown>;
   const client_id = generateToken();
   return Response.json(
     {
       client_id,
+      client_id_issued_at: Math.floor(Date.now() / 1000),
       client_name: body.client_name || "MCP Client",
       redirect_uris: body.redirect_uris || [],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: "none",
+      scope: "mcp",
     },
     { status: 201, headers: corsHeaders() },
   );
@@ -786,7 +797,12 @@ export default {
       );
     }
 
-    // OAuth discovery (RFC 8414)
+    // Protected Resource Metadata (RFC 9728)
+    if (path === "/.well-known/oauth-protected-resource" && request.method === "GET") {
+      return Response.json(protectedResourceMetadata(url.origin), { headers: corsHeaders() });
+    }
+
+    // OAuth Authorization Server Metadata (RFC 8414)
     if (path === "/.well-known/oauth-authorization-server" && request.method === "GET") {
       return Response.json(oauthMetadata(url.origin), { headers: corsHeaders() });
     }
@@ -815,7 +831,7 @@ export default {
       return new Response("Unauthorized", {
         status: 401,
         headers: {
-          "WWW-Authenticate": `Bearer resource_metadata="${url.origin}/.well-known/oauth-authorization-server"`,
+          "WWW-Authenticate": "Bearer",
           ...corsHeaders(),
         },
       });
