@@ -103,8 +103,15 @@ wrangler secret put API_TOKEN
 
 ### 8. Connect Claude Code
 
+**Quick install (one-liner — works on any computer):**
+
 ```bash
-# Streamable HTTP transport (recommended)
+curl -sL https://raw.githubusercontent.com/bill97385/cloudflare-memory-mcp/main/install.sh | bash
+```
+
+Or manually:
+
+```bash
 claude mcp add --scope user --transport http memory-mcp \
   https://memory-mcp-server.YOUR_SUBDOMAIN.workers.dev/mcp \
   --header "Authorization:Bearer YOUR_TOKEN"
