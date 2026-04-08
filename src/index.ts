@@ -28,8 +28,8 @@ const ACCESS_TOKEN_TTL_S = 30 * 24 * 60 * 60;
 const REFRESH_TOKEN_TTL_S = 90 * 24 * 60 * 60;
 const SSE_KEEPALIVE_MS = 15000;
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
-const L0_TOKEN_BUDGET = 200; // ~50 tokens ≈ 200 chars
-const L1_TOKEN_BUDGET = 500; // ~120 tokens ≈ 500 chars
+const L0_CHAR_LIMIT = 200; // ~50 tokens
+const L1_CHAR_LIMIT = 500; // ~120 tokens
 const encoder = new TextEncoder();
 
 const CORS_HEADERS: Record<string, string> = {
@@ -367,9 +367,9 @@ function formatMemory(r: any, extra?: string): string {
   return text;
 }
 
-function truncateToTokenBudget(text: string, charBudget: number): string {
-  if (text.length <= charBudget) return text;
-  return text.substring(0, charBudget) + "…";
+function truncateToCharLimit(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  return text.substring(0, limit) + "…";
 }
 
 function formatMemoryResults(results: any[], header?: string): string {
@@ -821,13 +821,14 @@ async function embed(text: string, env: Env): Promise<number[]> {
 }
 
 async function vectorSearch(
-  query: string,
+  queryOrEmbedding: string | number[],
   env: Env,
   opts: { topK?: number; category?: string; wing?: string; room?: string; extraConditions?: string[]; extraBinds?: unknown[] } = {},
-): Promise<{ results: any[]; scoreMap: Map<string, number> }> {
-  const embedding = await embed(query, env);
+): Promise<{ results: any[]; scoreMap: Map<string, number>; embedding: number[] }> {
+  const embedding = typeof queryOrEmbedding === "string"
+    ? await embed(queryOrEmbedding, env)
+    : queryOrEmbedding;
 
-  // Build Vectorize metadata filter for pre-filtering (improves recall vs post-filter)
   const filter: Record<string, string> = {};
   if (opts.category) filter.category = opts.category;
   if (opts.wing) filter.wing_name = opts.wing;
@@ -838,7 +839,7 @@ async function vectorSearch(
     filter: Object.keys(filter).length > 0 ? filter : undefined,
     returnMetadata: "all",
   });
-  if (!matches.matches.length) return { results: [], scoreMap: new Map() };
+  if (!matches.matches.length) return { results: [], scoreMap: new Map(), embedding };
 
   const ids = matches.matches.map((m) => m.id);
   const placeholders = ids.map(() => "?").join(",");
@@ -852,7 +853,7 @@ async function vectorSearch(
 
   const { results } = await env.DB.prepare(query2).bind(...binds).all();
   const scoreMap = new Map(matches.matches.map((m) => [m.id, m.score]));
-  return { results: results as any[], scoreMap };
+  return { results: results as any[], scoreMap, embedding };
 }
 
 function formatScoredResults(results: any[], scoreMap: Map<string, number>, label: string): string {
@@ -932,8 +933,7 @@ async function memorySearch(
 
   const topK = Math.min(args.limit || 10, 50);
 
-  // Try pre-filter first (fast, works for new vectors with wing/room metadata)
-  let { results, scoreMap } = await vectorSearch(args.query, env, {
+  let { results, scoreMap, embedding } = await vectorSearch(args.query, env, {
     topK,
     category: args.category,
     wing: args.wing,
@@ -942,15 +942,13 @@ async function memorySearch(
     extraBinds: binds,
   });
 
-  // Fallback: if pre-filter found nothing but wing/room was specified,
-  // retry without pre-filter and use SQL post-filter (for legacy vectors without metadata)
+  // Fallback for legacy vectors without wing/room metadata: reuse embedding, use SQL post-filter
   if (!results.length && (args.wing || args.room)) {
     const fallbackConditions = [...conditions];
     const fallbackBinds = [...binds];
     addPalaceFilters(fallbackConditions, fallbackBinds, args);
-    ({ results, scoreMap } = await vectorSearch(args.query, env, {
+    ({ results, scoreMap } = await vectorSearch(embedding, env, {
       topK,
-      category: args.category,
       extraConditions: fallbackConditions,
       extraBinds: fallbackBinds,
     }));
@@ -1064,7 +1062,7 @@ async function memoryDelete(args: { id: string }, env: Env) {
 // --- Palace tools ---
 
 async function palaceOverview(env: Env) {
-  const [wingsRes, roomsRes, tunnelsRes, unorganized, hallCountsRes, totalRes, agentCountRes, lastUpdatedRes] = await Promise.all([
+  const [wingsRes, roomsRes, tunnelsRes, unorganized, hallCountsRes, agentCountRes, lastUpdatedRes] = await Promise.all([
     env.DB.prepare(
       "SELECT w.*, (SELECT COUNT(*) FROM memories WHERE wing_id = w.id) as mem_count FROM wings w ORDER BY w.name",
     ).all(),
@@ -1083,7 +1081,6 @@ async function palaceOverview(env: Env) {
     env.DB.prepare(
       "SELECT wing_id, room_id, hall, COUNT(*) as cnt FROM memories WHERE wing_id IS NOT NULL GROUP BY wing_id, room_id, hall",
     ).all(),
-    env.DB.prepare("SELECT COUNT(*) as cnt FROM memories").first() as Promise<any>,
     env.DB.prepare("SELECT COUNT(*) as cnt FROM agents").first() as Promise<any>,
     env.DB.prepare("SELECT MAX(updated_at) as last FROM memories").first() as Promise<any>,
   ]);
@@ -1107,8 +1104,11 @@ async function palaceOverview(env: Env) {
     roomsByWing.set(room.wing_name, list);
   }
 
+  const organizedCount = wings.reduce((sum, w) => sum + (w.mem_count || 0), 0);
+  const totalCount = organizedCount + (unorganized?.cnt || 0);
+
   let text = "# Memory Palace\n\n";
-  text += `**Stats:** ${totalRes?.cnt || 0} memories | ${wings.length} wings | ${rooms.length} rooms | ${tunnels.length} tunnels | ${agentCountRes?.cnt || 0} agents`;
+  text += `**Stats:** ${totalCount} memories | ${wings.length} wings | ${rooms.length} rooms | ${tunnels.length} tunnels | ${agentCountRes?.cnt || 0} agents`;
   if (lastUpdatedRes?.last) text += ` | Last updated: ${lastUpdatedRes.last}`;
   text += "\n\n";
 
@@ -1247,7 +1247,7 @@ async function wakeupContext(
   if (layer === "L0") {
     const rows = await fetchIdentity(env);
     if (!rows.length) return textResult("# L0 Identity\n\nNo identity set. Use identity_manage to set key-value pairs.");
-    return textResult(truncateToTokenBudget(`# L0 Identity\n\n${formatIdentity(rows)}`, L0_TOKEN_BUDGET));
+    return textResult(truncateToCharLimit(`# L0 Identity\n\n${formatIdentity(rows)}`, L0_CHAR_LIMIT));
   }
 
   if (layer === "all") {
@@ -1256,11 +1256,11 @@ async function wakeupContext(
       fetchIdentity(env),
       fetchL1(env, limit),
     ]);
-    const l0 = truncateToTokenBudget(formatIdentity(identityRows), L0_TOKEN_BUDGET);
+    const l0 = truncateToCharLimit(formatIdentity(identityRows), L0_CHAR_LIMIT);
     let l1 = l1Rows.length
       ? l1Rows.map((r) => `[${r.wing_name || "?"}] ${r.content.substring(0, 80)}`).join("\n")
       : "(no critical facts — set importance >= 8 or layer = L1)";
-    l1 = truncateToTokenBudget(l1, L1_TOKEN_BUDGET);
+    l1 = truncateToCharLimit(l1, L1_CHAR_LIMIT);
     return textResult(`# Wake-up Context (~170 tokens)\n\n## L0 Identity\n${l0}\n\n## L1 Critical Facts\n${l1}`);
   }
 
@@ -1318,39 +1318,58 @@ async function identityManage(
   }
 }
 
-function parseConvosText(text: string, defaultWing?: string, source?: string): Array<{ content: string; wing?: string; room?: string; hall: string; tags: string[]; category: string }> {
-  // Split by common conversation separators: "Human:", "Assistant:", "User:", "Claude:", blank lines between turns
-  const blocks = text.split(/\n(?=(?:Human|Assistant|User|Claude|user|assistant|H:|A:)\s*:)/i).filter((b) => b.trim().length > 50);
-  return blocks.map((block) => ({
-    content: block.trim().substring(0, 2000),
-    wing: defaultWing,
-    room: source || "conversations",
-    hall: "events" as const,
-    tags: source ? [source] : ["conversation"],
-    category: "reference",
-  }));
+const GENERAL_CLASSIFIERS: Array<{ pattern: RegExp; hall: string; category: string }> = [
+  { pattern: /decide|decision|chose|approved|agreed/, hall: "facts", category: "project" },
+  { pattern: /milestone|launch|deploy|release|complete|ship/, hall: "events", category: "project" },
+  { pattern: /bug|issue|problem|error|fail|crash/, hall: "discoveries", category: "project" },
+  { pattern: /prefer|like|want|always|never|habit/, hall: "preferences", category: "user" },
+  { pattern: /lesson|learn|should|avoid|recommend|tip|advice/, hall: "advice", category: "feedback" },
+];
+
+type MinedBlock = { content: string; wing?: string; room?: string; hall: string; tags: string[]; category: string };
+
+function parseTextBlocks(
+  text: string,
+  splitRegex: RegExp,
+  minLength: number,
+  classify: (block: string) => { hall: string; category: string; tags: string[] },
+  defaultWing?: string,
+  defaultRoom?: string,
+): MinedBlock[] {
+  return text
+    .split(splitRegex)
+    .filter((b) => b.trim().length > minLength)
+    .map((block) => {
+      const { hall, category, tags } = classify(block);
+      return { content: block.trim().substring(0, 2000), wing: defaultWing, room: defaultRoom, hall, tags, category };
+    });
 }
 
-function parseGeneralText(text: string, defaultWing?: string): Array<{ content: string; wing?: string; room?: string; hall: string; tags: string[]; category: string }> {
-  // Split by double newlines (paragraphs) or markdown headers
-  const blocks = text.split(/\n{2,}|(?=^#{1,3}\s)/m).filter((b) => b.trim().length > 20);
-  return blocks.map((block) => {
-    const lower = block.toLowerCase();
-    let hall = "facts";
-    let category = "general";
-    if (/decide|decision|chose|approved|agreed/i.test(lower)) { hall = "facts"; category = "project"; }
-    else if (/milestone|launch|deploy|release|complete|ship/i.test(lower)) { hall = "events"; category = "project"; }
-    else if (/bug|issue|problem|error|fail|crash/i.test(lower)) { hall = "discoveries"; category = "project"; }
-    else if (/prefer|like|want|always|never|habit/i.test(lower)) { hall = "preferences"; category = "user"; }
-    else if (/lesson|learn|should|avoid|recommend|tip|advice/i.test(lower)) { hall = "advice"; category = "feedback"; }
-    return {
-      content: block.trim().substring(0, 2000),
-      wing: defaultWing,
-      hall,
-      category,
-      tags: ["mined"],
-    };
-  });
+function parseConvosText(text: string, defaultWing?: string, source?: string): MinedBlock[] {
+  return parseTextBlocks(
+    text,
+    /\n(?=(?:Human|Assistant|User|Claude|H|A)\s*:)/i,
+    50,
+    () => ({ hall: "events", category: "reference", tags: source ? [source] : ["conversation"] }),
+    defaultWing,
+    source || "conversations",
+  );
+}
+
+function parseGeneralText(text: string, defaultWing?: string): MinedBlock[] {
+  return parseTextBlocks(
+    text,
+    /\n{2,}|(?=^#{1,3}\s)/m,
+    20,
+    (block) => {
+      const lower = block.toLowerCase();
+      for (const c of GENERAL_CLASSIFIERS) {
+        if (c.pattern.test(lower)) return { hall: c.hall, category: c.category, tags: ["mined"] };
+      }
+      return { hall: "facts", category: "general", tags: ["mined"] };
+    },
+    defaultWing,
+  );
 }
 
 async function memoryMine(
