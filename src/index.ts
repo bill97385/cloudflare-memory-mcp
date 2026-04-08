@@ -3,6 +3,7 @@ interface Env {
   VECTORIZE: VectorizeIndex;
   AI: Ai;
   API_TOKEN: string;
+  MCP_SESSION: DurableObjectNamespace;
 }
 
 interface JsonRpcRequest {
@@ -838,41 +839,40 @@ export default {
         return new Response("Not Found", { status: 404, headers: corsHeaders() });
       }
 
+      // SSE via Durable Object (for claude.ai web)
       if (subPath === "/sse" && request.method === "GET") {
-        const encoder = new TextEncoder();
-        const messageUrl = `${url.origin}/s/${pathToken}/message`;
-        const stream = new ReadableStream({
-          start(controller) {
-            controller.enqueue(
-              encoder.encode(`event: endpoint\ndata: ${messageUrl}\n\n`),
-            );
-          },
-        });
-        return new Response(stream, {
-          headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            ...corsHeaders(),
-          },
-        });
+        const sessionId = crypto.randomUUID();
+        const doId = env.MCP_SESSION.idFromName(sessionId);
+        const stub = env.MCP_SESSION.get(doId);
+        const messageUrl = `${url.origin}/s/${pathToken}/message?session=${sessionId}`;
+        return stub.fetch(
+          new Request(`https://internal/sse?messageUrl=${encodeURIComponent(messageUrl)}`, {
+            headers: request.headers,
+          }),
+        );
       }
 
-      if (subPath === "/message" && request.method === "POST") {
-        const body = await request.json();
-        if (Array.isArray(body)) {
-          const responses = await Promise.all(
-            body.map((r: JsonRpcRequest) => processRequest(r, env)),
+      // Message via Durable Object
+      if (subPath.startsWith("/message") && request.method === "POST") {
+        const sessionId = url.searchParams.get("session");
+        if (!sessionId) {
+          return Response.json(
+            { error: "Missing session" },
+            { status: 400, headers: corsHeaders() },
           );
-          return Response.json(responses.filter(Boolean), { headers: corsHeaders() });
         }
-        const response = await processRequest(body as JsonRpcRequest, env);
-        if (!response) {
-          return new Response(null, { status: 204, headers: corsHeaders() });
-        }
-        return Response.json(response, { headers: corsHeaders() });
+        const doId = env.MCP_SESSION.idFromName(sessionId);
+        const stub = env.MCP_SESSION.get(doId);
+        return stub.fetch(
+          new Request("https://internal/message", {
+            method: "POST",
+            body: request.body,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
       }
 
-      // Streamable HTTP on secret path
+      // Streamable HTTP on secret path (fallback)
       if ((subPath === "/mcp" || subPath === "/") && request.method === "POST") {
         const body = await request.json();
         if (Array.isArray(body)) {
@@ -907,17 +907,29 @@ export default {
     if (path === "/sse" && request.method === "GET") {
       const encoder = new TextEncoder();
       const baseUrl = url.origin;
+      let keepAliveInterval: ReturnType<typeof setInterval>;
       const stream = new ReadableStream({
         start(controller) {
           controller.enqueue(
             encoder.encode(`event: endpoint\ndata: ${baseUrl}/message\n\n`),
           );
+          keepAliveInterval = setInterval(() => {
+            try {
+              controller.enqueue(encoder.encode(`: keepalive\n\n`));
+            } catch {
+              clearInterval(keepAliveInterval);
+            }
+          }, 15000);
+        },
+        cancel() {
+          clearInterval(keepAliveInterval);
         },
       });
       return new Response(stream, {
         headers: {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
+          Connection: "keep-alive",
           ...corsHeaders(),
         },
       });
@@ -949,3 +961,89 @@ export default {
     return new Response("Not Found", { status: 404, headers: corsHeaders() });
   },
 };
+
+// =====================
+// Durable Object: McpSession
+// Maintains SSE stream so POST responses can be pushed through it
+// =====================
+
+export class McpSession implements DurableObject {
+  private sseController: ReadableStreamDefaultController<Uint8Array> | null =
+    null;
+  private encoder = new TextEncoder();
+  private keepAliveInterval: ReturnType<typeof setInterval> | null = null;
+
+  constructor(
+    private state: DurableObjectState,
+    private env: Env,
+  ) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/sse" && request.method === "GET") {
+      const messageUrl = url.searchParams.get("messageUrl") || "";
+      const stream = new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          this.sseController = controller;
+          controller.enqueue(
+            this.encoder.encode(`event: endpoint\ndata: ${messageUrl}\n\n`),
+          );
+          this.keepAliveInterval = setInterval(() => {
+            try {
+              controller.enqueue(this.encoder.encode(`: keepalive\n\n`));
+            } catch {
+              this.cleanup();
+            }
+          }, 15000);
+        },
+        cancel: () => {
+          this.cleanup();
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
+    if (url.pathname === "/message" && request.method === "POST") {
+      const body = (await request.json()) as JsonRpcRequest;
+
+      // Notifications (no id) don't need a response
+      if (body.id === undefined) {
+        return new Response(null, { status: 202 });
+      }
+
+      const response = await processRequest(body, this.env);
+
+      if (this.sseController && response) {
+        try {
+          const data = JSON.stringify(response);
+          this.sseController.enqueue(
+            this.encoder.encode(`event: message\ndata: ${data}\n\n`),
+          );
+        } catch {
+          // SSE connection already closed
+        }
+      }
+
+      return new Response(null, { status: 202 });
+    }
+
+    return new Response("Not Found", { status: 404 });
+  }
+
+  private cleanup() {
+    if (this.keepAliveInterval) {
+      clearInterval(this.keepAliveInterval);
+      this.keepAliveInterval = null;
+    }
+    this.sseController = null;
+  }
+}

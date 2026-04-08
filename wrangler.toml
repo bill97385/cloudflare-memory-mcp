@@ -13,3 +13,12 @@ database_id = "e35a1410-1485-49b6-8e2c-262e32a34ba1"
 [[vectorize]]
 binding = "VECTORIZE"
 index_name = "memory-vectors"
+
+[durable_objects]
+bindings = [
+  { name = "MCP_SESSION", class_name = "McpSession" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["McpSession"]
