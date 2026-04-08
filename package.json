@@ -1,0 +1,15 @@
+{
+  "name": "cloudflare-memory-mcp",
+  "version": "1.0.0",
+  "description": "A cloud-based MCP memory server powered by Cloudflare Workers, D1, and Vectorize. Access your AI memories from any device.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate": "wrangler d1 migrations apply memory-mcp --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241218.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.0.0"
+  }
+}
