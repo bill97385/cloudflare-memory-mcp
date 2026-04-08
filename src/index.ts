@@ -28,6 +28,8 @@ const ACCESS_TOKEN_TTL_S = 30 * 24 * 60 * 60;
 const REFRESH_TOKEN_TTL_S = 90 * 24 * 60 * 60;
 const SSE_KEEPALIVE_MS = 15000;
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
+const L0_TOKEN_BUDGET = 200; // ~50 tokens ≈ 200 chars
+const L1_TOKEN_BUDGET = 500; // ~120 tokens ≈ 500 chars
 const encoder = new TextEncoder();
 
 const CORS_HEADERS: Record<string, string> = {
@@ -229,10 +231,11 @@ const TOOLS = [
   },
   {
     name: "memory_mine",
-    description: "Batch import multiple memories at once. Accepts an array of memories, generates embeddings in bulk, and stores them efficiently.",
+    description: "Import memories. Three modes: 'batch' (array of structured memories), 'convos' (raw conversation text — auto-splits by speaker turns), 'general' (raw text — auto-classifies into decisions/milestones/problems/preferences).",
     inputSchema: {
       type: "object",
       properties: {
+        mode: { type: "string", description: "Mining mode (default: batch)", enum: ["batch", "convos", "general"] },
         memories: {
           type: "array",
           items: {
@@ -249,9 +252,13 @@ const TOOLS = [
             },
             required: ["content"],
           },
+          description: "Array of memories (for 'batch' mode)",
         },
+        text: { type: "string", description: "Raw text to mine (for 'convos' or 'general' mode)" },
+        wing: { type: "string", description: "Default wing for mined memories" },
+        room: { type: "string", description: "Default room for mined memories" },
+        source: { type: "string", description: "Source label (e.g. 'claude-export', 'chatgpt', 'slack')" },
       },
-      required: ["memories"],
     },
   },
   {
@@ -358,6 +365,11 @@ function formatMemory(r: any, extra?: string): string {
     text += `\nValid: ${r.valid_from || "∞"} → ${r.valid_to || "present"}`;
   }
   return text;
+}
+
+function truncateToTokenBudget(text: string, charBudget: number): string {
+  if (text.length <= charBudget) return text;
+  return text.substring(0, charBudget) + "…";
 }
 
 function formatMemoryResults(results: any[], header?: string): string {
@@ -811,13 +823,19 @@ async function embed(text: string, env: Env): Promise<number[]> {
 async function vectorSearch(
   query: string,
   env: Env,
-  opts: { topK?: number; category?: string; extraConditions?: string[]; extraBinds?: unknown[] } = {},
+  opts: { topK?: number; category?: string; wing?: string; room?: string; extraConditions?: string[]; extraBinds?: unknown[] } = {},
 ): Promise<{ results: any[]; scoreMap: Map<string, number> }> {
   const embedding = await embed(query, env);
-  const filter = opts.category ? { category: opts.category } : undefined;
+
+  // Build Vectorize metadata filter for pre-filtering (improves recall vs post-filter)
+  const filter: Record<string, string> = {};
+  if (opts.category) filter.category = opts.category;
+  if (opts.wing) filter.wing_name = opts.wing;
+  if (opts.room) filter.room_name = opts.room;
+
   const matches = await env.VECTORIZE.query(embedding, {
     topK: opts.topK || 20,
-    filter,
+    filter: Object.keys(filter).length > 0 ? filter : undefined,
     returnMetadata: "all",
   });
   if (!matches.matches.length) return { results: [], scoreMap: new Map() };
@@ -884,13 +902,17 @@ async function memoryStore(
     resolveWingRoom(env, args.wing, args.room, args.wing_type),
   ]);
 
+  const vecMeta: Record<string, string> = { category };
+  if (args.wing) vecMeta.wing_name = args.wing;
+  if (args.room) vecMeta.room_name = args.room;
+
   await Promise.all([
     env.DB.prepare(
       "INSERT INTO memories (id, content, category, tags, wing_id, room_id, hall, is_closet, source_ids, importance, layer, valid_from, valid_to, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
       .bind(id, args.content, category, tags, wingId, roomId, hall, isCloset, sourceIds, importance, layer, args.valid_from || null, args.valid_to || null, now, now)
       .run(),
-    env.VECTORIZE.upsert([{ id, values: embedding, metadata: { category } }]),
+    env.VECTORIZE.upsert([{ id, values: embedding, metadata: vecMeta }]),
   ]);
 
   const location = [args.wing, args.room].filter(Boolean).join("/");
@@ -902,17 +924,37 @@ async function memorySearch(
   args: { query: string; category?: string; wing?: string; room?: string; hall?: string; as_of?: string; limit?: number },
   env: Env,
 ) {
+  // Temporal and hall filters still need SQL post-filter
   const conditions: string[] = [];
   const binds: unknown[] = [];
-  addPalaceFilters(conditions, binds, args);
+  if (args.hall) { conditions.push("m.hall = ?"); binds.push(args.hall); }
   addTemporalFilters(conditions, binds, args);
 
-  const { results, scoreMap } = await vectorSearch(args.query, env, {
-    topK: Math.min(args.limit || 10, 50),
+  const topK = Math.min(args.limit || 10, 50);
+
+  // Try pre-filter first (fast, works for new vectors with wing/room metadata)
+  let { results, scoreMap } = await vectorSearch(args.query, env, {
+    topK,
     category: args.category,
+    wing: args.wing,
+    room: args.room,
     extraConditions: conditions,
     extraBinds: binds,
   });
+
+  // Fallback: if pre-filter found nothing but wing/room was specified,
+  // retry without pre-filter and use SQL post-filter (for legacy vectors without metadata)
+  if (!results.length && (args.wing || args.room)) {
+    const fallbackConditions = [...conditions];
+    const fallbackBinds = [...binds];
+    addPalaceFilters(fallbackConditions, fallbackBinds, args);
+    ({ results, scoreMap } = await vectorSearch(args.query, env, {
+      topK,
+      category: args.category,
+      extraConditions: fallbackConditions,
+      extraBinds: fallbackBinds,
+    }));
+  }
 
   if (!results.length) return textResult("No memories found.");
   return textResult(formatScoredResults(results, scoreMap, "relevance"));
@@ -1022,7 +1064,7 @@ async function memoryDelete(args: { id: string }, env: Env) {
 // --- Palace tools ---
 
 async function palaceOverview(env: Env) {
-  const [wingsRes, roomsRes, tunnelsRes, unorganized, hallCountsRes] = await Promise.all([
+  const [wingsRes, roomsRes, tunnelsRes, unorganized, hallCountsRes, totalRes, agentCountRes, lastUpdatedRes] = await Promise.all([
     env.DB.prepare(
       "SELECT w.*, (SELECT COUNT(*) FROM memories WHERE wing_id = w.id) as mem_count FROM wings w ORDER BY w.name",
     ).all(),
@@ -1041,6 +1083,9 @@ async function palaceOverview(env: Env) {
     env.DB.prepare(
       "SELECT wing_id, room_id, hall, COUNT(*) as cnt FROM memories WHERE wing_id IS NOT NULL GROUP BY wing_id, room_id, hall",
     ).all(),
+    env.DB.prepare("SELECT COUNT(*) as cnt FROM memories").first() as Promise<any>,
+    env.DB.prepare("SELECT COUNT(*) as cnt FROM agents").first() as Promise<any>,
+    env.DB.prepare("SELECT MAX(updated_at) as last FROM memories").first() as Promise<any>,
   ]);
 
   const wings = wingsRes.results as any[];
@@ -1063,8 +1108,11 @@ async function palaceOverview(env: Env) {
   }
 
   let text = "# Memory Palace\n\n";
+  text += `**Stats:** ${totalRes?.cnt || 0} memories | ${wings.length} wings | ${rooms.length} rooms | ${tunnels.length} tunnels | ${agentCountRes?.cnt || 0} agents`;
+  if (lastUpdatedRes?.last) text += ` | Last updated: ${lastUpdatedRes.last}`;
+  text += "\n\n";
 
-  if (!wings.length && !unorganized?.cnt) return textResult("Palace is empty. Store memories with wing/room to build the structure.");
+  if (!wings.length && !unorganized?.cnt) return textResult(text + "Palace is empty. Store memories with wing/room to build the structure.");
 
   for (const wing of wings) {
     text += `## 🏛️ ${wing.name} (${wing.type}) — ${wing.mem_count} memories\n`;
@@ -1199,7 +1247,7 @@ async function wakeupContext(
   if (layer === "L0") {
     const rows = await fetchIdentity(env);
     if (!rows.length) return textResult("# L0 Identity\n\nNo identity set. Use identity_manage to set key-value pairs.");
-    return textResult(`# L0 Identity\n\n${formatIdentity(rows)}`);
+    return textResult(truncateToTokenBudget(`# L0 Identity\n\n${formatIdentity(rows)}`, L0_TOKEN_BUDGET));
   }
 
   if (layer === "all") {
@@ -1208,12 +1256,12 @@ async function wakeupContext(
       fetchIdentity(env),
       fetchL1(env, limit),
     ]);
-    let text = `# Wake-up Context\n\n## L0 Identity\n${formatIdentity(identityRows)}`;
-    text += "\n\n## L1 Critical Facts\n\n";
-    text += l1Rows.length
-      ? l1Rows.map((r) => formatMemory(r)).join("\n\n---\n\n")
+    const l0 = truncateToTokenBudget(formatIdentity(identityRows), L0_TOKEN_BUDGET);
+    let l1 = l1Rows.length
+      ? l1Rows.map((r) => `[${r.wing_name || "?"}] ${r.content.substring(0, 80)}`).join("\n")
       : "(no critical facts — set importance >= 8 or layer = L1)";
-    return textResult(text);
+    l1 = truncateToTokenBudget(l1, L1_TOKEN_BUDGET);
+    return textResult(`# Wake-up Context (~170 tokens)\n\n## L0 Identity\n${l0}\n\n## L1 Critical Facts\n${l1}`);
   }
 
   if (layer === "L1") {
@@ -1270,19 +1318,72 @@ async function identityManage(
   }
 }
 
+function parseConvosText(text: string, defaultWing?: string, source?: string): Array<{ content: string; wing?: string; room?: string; hall: string; tags: string[]; category: string }> {
+  // Split by common conversation separators: "Human:", "Assistant:", "User:", "Claude:", blank lines between turns
+  const blocks = text.split(/\n(?=(?:Human|Assistant|User|Claude|user|assistant|H:|A:)\s*:)/i).filter((b) => b.trim().length > 50);
+  return blocks.map((block) => ({
+    content: block.trim().substring(0, 2000),
+    wing: defaultWing,
+    room: source || "conversations",
+    hall: "events" as const,
+    tags: source ? [source] : ["conversation"],
+    category: "reference",
+  }));
+}
+
+function parseGeneralText(text: string, defaultWing?: string): Array<{ content: string; wing?: string; room?: string; hall: string; tags: string[]; category: string }> {
+  // Split by double newlines (paragraphs) or markdown headers
+  const blocks = text.split(/\n{2,}|(?=^#{1,3}\s)/m).filter((b) => b.trim().length > 20);
+  return blocks.map((block) => {
+    const lower = block.toLowerCase();
+    let hall = "facts";
+    let category = "general";
+    if (/decide|decision|chose|approved|agreed/i.test(lower)) { hall = "facts"; category = "project"; }
+    else if (/milestone|launch|deploy|release|complete|ship/i.test(lower)) { hall = "events"; category = "project"; }
+    else if (/bug|issue|problem|error|fail|crash/i.test(lower)) { hall = "discoveries"; category = "project"; }
+    else if (/prefer|like|want|always|never|habit/i.test(lower)) { hall = "preferences"; category = "user"; }
+    else if (/lesson|learn|should|avoid|recommend|tip|advice/i.test(lower)) { hall = "advice"; category = "feedback"; }
+    return {
+      content: block.trim().substring(0, 2000),
+      wing: defaultWing,
+      hall,
+      category,
+      tags: ["mined"],
+    };
+  });
+}
+
 async function memoryMine(
-  args: { memories: Array<{ content: string; category?: string; tags?: string[]; wing?: string; room?: string; hall?: string; importance?: number; layer?: string }> },
+  args: {
+    mode?: string;
+    memories?: Array<{ content: string; category?: string; tags?: string[]; wing?: string; room?: string; hall?: string; importance?: number; layer?: string }>;
+    text?: string; wing?: string; room?: string; source?: string;
+  },
   env: Env,
 ) {
-  if (!args.memories?.length) return textResult("No memories to import.");
+  const mode = args.mode || "batch";
+  let memories: Array<{ content: string; category?: string; tags?: string[]; wing?: string; room?: string; hall?: string; importance?: number; layer?: string }>;
+
+  if (mode === "convos") {
+    if (!args.text) return textResult("Error: 'text' is required for convos mode.");
+    memories = parseConvosText(args.text, args.wing, args.source);
+  } else if (mode === "general") {
+    if (!args.text) return textResult("Error: 'text' is required for general mode.");
+    memories = parseGeneralText(args.text, args.wing);
+  } else {
+    if (!args.memories?.length) return textResult("No memories to import.");
+    memories = args.memories;
+  }
+
+  if (!memories.length) return textResult("No content extracted from the provided text.");
 
   const BATCH_SIZE = 100;
-  const memories = args.memories.slice(0, 500); // Cap at 500 to avoid timeouts
+  const capped = memories.slice(0, 500);
   let storedCount = 0;
 
   // Deduplicate and pre-resolve all unique wing/room combinations
   const wingRoomCache = new Map<string, { wingId: string | null; roomId: string | null }>();
-  const uniqueKeys = [...new Set(memories.map((m) => `${m.wing || ""}/${m.room || ""}`))];
+  const uniqueKeys = [...new Set(capped.map((m) => `${m.wing || ""}/${m.room || ""}`))];
   const resolveResults = await Promise.all(
     uniqueKeys.map(async (key) => {
       const [wing, room] = key.split("/");
@@ -1292,8 +1393,8 @@ async function memoryMine(
   );
   for (const r of resolveResults) wingRoomCache.set(r.key, r);
 
-  for (let i = 0; i < memories.length; i += BATCH_SIZE) {
-    const batch = memories.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < capped.length; i += BATCH_SIZE) {
+    const batch = capped.slice(i, i + BATCH_SIZE);
 
     // Batch embedding
     const embResult = (await env.AI.run(EMBEDDING_MODEL, {
@@ -1317,11 +1418,12 @@ async function memoryMine(
       );
     });
 
-    const vectors = ids.map((id, j) => ({
-      id,
-      values: embResult.data[j],
-      metadata: { category: batch[j].category || "general" },
-    }));
+    const vectors = ids.map((id, j) => {
+      const meta: Record<string, string> = { category: batch[j].category || "general" };
+      if (batch[j].wing) meta.wing_name = batch[j].wing!;
+      if (batch[j].room) meta.room_name = batch[j].room!;
+      return { id, values: embResult.data[j], metadata: meta };
+    });
 
     // D1 + Vectorize in parallel
     await Promise.all([
@@ -1332,7 +1434,7 @@ async function memoryMine(
     storedCount += batch.length;
   }
 
-  const wings = new Set(memories.map((m) => m.wing).filter(Boolean));
+  const wings = new Set(capped.map((m) => m.wing).filter(Boolean));
   return textResult(`Mined ${storedCount} memories (${wings.size} wings referenced).`);
 }
 
