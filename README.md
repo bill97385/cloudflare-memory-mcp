@@ -1,34 +1,84 @@
 # Cloudflare Memory MCP Server
 
-A cloud-based **MCP (Model Context Protocol) memory server** that lets Claude Code (or any MCP client) store and retrieve memories from anywhere. Built on Cloudflare Workers with D1 (SQLite) for storage and Vectorize + Workers AI for semantic search.
+A cloud-based **MCP (Model Context Protocol) memory server** that gives Claude persistent, cross-device memory. Built on Cloudflare Workers (free tier).
 
-## Why
+Inspired by [MemPalace](https://github.com/milla-jovovich/mempalace) — a local AI memory system that achieved 96.6% on LongMemEval benchmarks. This project reimplements the core concept (semantic memory storage + retrieval) as a cloud-native MCP server on Cloudflare, enabling access from any device without local dependencies.
 
-Local memory systems only work on one machine. This server runs in the cloud — add it to Claude Code on any computer and share the same memory across all devices and conversations.
+## Quick Start (Let AI Deploy For You)
 
-## Features
+Have Claude Code or any AI assistant deploy this for you. Just paste this prompt:
 
-- **Semantic search** — find memories by meaning, not just keywords (powered by Vectorize + Workers AI embeddings)
-- **Categorized storage** — organize memories as `user`, `project`, `feedback`, `reference`, or `general`
-- **Tag filtering** — tag memories and filter by tags
-- **Bearer token auth** — simple API key authentication
-- **Zero dependencies** — runs entirely on Cloudflare's free tier
+> I want to deploy my own cloud memory MCP server. Here's the repo: https://github.com/bill97385/cloudflare-memory-mcp
+>
+> Please:
+> 1. Clone the repo and run `npm install`
+> 2. Run `wrangler login` (I'll authenticate in the browser)
+> 3. Run the deploy script: `bash deploy.sh`
+> 4. Add the MCP server to my Claude Code with the token from step 3
+>
+> I already have a free Cloudflare account.
 
-## Architecture
+That's it. The `deploy.sh` script handles everything automatically.
 
+## One-Command Deploy
+
+If you prefer to run it yourself:
+
+```bash
+git clone https://github.com/bill97385/cloudflare-memory-mcp.git
+cd cloudflare-memory-mcp
+npm install
+wrangler login
+bash deploy.sh
 ```
-Claude Code (any device)
-    │
-    │  HTTPS + Bearer Token
-    ▼
-Cloudflare Worker ─── MCP Protocol (Streamable HTTP / SSE)
-    │
-    ├── D1 (SQLite)      → structured memory storage
-    ├── Vectorize         → semantic vector search
-    └── Workers AI        → text embedding generation
+
+The script will:
+1. Create D1 database and Vectorize index
+2. Update `wrangler.toml` with your database ID
+3. Run database migrations
+4. Deploy the Worker
+5. Generate and set a secure API token
+6. Print the `claude mcp add` command to connect
+
+## Connect Claude Code
+
+After deploying, run the command printed by `deploy.sh`:
+
+```bash
+claude mcp add --scope user --transport http memory-mcp \
+  https://memory-mcp-server.YOUR_SUBDOMAIN.workers.dev/mcp \
+  --header "Authorization:Bearer YOUR_TOKEN"
 ```
 
-## MCP Tools
+On additional computers, just run this same command — all devices share the same cloud memory.
+
+## Connect claude.ai (Web)
+
+1. Go to **claude.ai** → **Customize** → **Connectors**
+2. Click **+** → **Add custom connector**
+3. Enter your Worker URL with the secret path:
+   ```
+   https://memory-mcp-server.YOUR_SUBDOMAIN.workers.dev/s/YOUR_TOKEN/sse
+   ```
+4. Complete the OAuth authorization with your API token
+
+## How Memory Works
+
+The memory system is inspired by [MemPalace](https://github.com/milla-jovovich/mempalace)'s approach to AI memory — storing information semantically so it can be retrieved by meaning, not just keywords.
+
+### Categories
+
+Organize memories into 5 types (following MemPalace's structured approach):
+
+| Category | Purpose | Example |
+|----------|---------|---------|
+| `user` | Who you are — role, preferences, skills | "I'm a backend engineer who prefers Go" |
+| `project` | Active work, decisions, architecture | "Auth service migrating from JWT to sessions" |
+| `feedback` | What to do / not do in future work | "Don't mock the DB in integration tests" |
+| `reference` | Where to find things in external systems | "Bug tracker is in Linear project PLATFORM" |
+| `general` | Everything else | Any uncategorized memory |
+
+### MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -39,107 +89,95 @@ Cloudflare Worker ─── MCP Protocol (Streamable HTTP / SSE)
 | `memory_update` | Update an existing memory |
 | `memory_delete` | Delete a memory |
 
-## Setup
+### Examples
+
+Once connected, just talk naturally:
+
+- **"Remember that I prefer TypeScript over JavaScript"** → stores a `user` memory
+- **"What do you know about my preferences?"** → semantic search
+- **"List all project memories"** → filtered list
+
+## Architecture
+
+```
+Claude Code / claude.ai / Claude Desktop (any device)
+    │
+    │  HTTPS (Bearer Token / OAuth / Secret-path SSE)
+    ▼
+Cloudflare Worker
+    │
+    ├── D1 (SQLite)         → structured memory storage
+    ├── Vectorize           → semantic vector search (768-dim)
+    ├── Workers AI          → text embeddings (bge-base-en-v1.5)
+    └── Durable Objects     → SSE session management (for claude.ai web)
+```
+
+### Three Connection Methods
+
+| Method | Used By | Auth |
+|--------|---------|------|
+| Streamable HTTP (`/mcp`) | Claude Code CLI | Bearer token in header |
+| OAuth 2.0 + PKCE | Standard OAuth clients | Full OAuth flow |
+| Secret-path SSE (`/s/<token>/sse`) | claude.ai web | Token in URL path |
+
+## Manual Setup (Step by Step)
+
+If you prefer not to use `deploy.sh`:
 
 ### Prerequisites
 
 - [Cloudflare account](https://dash.cloudflare.com/sign-up) (free tier works)
 - [Node.js](https://nodejs.org/) 18+
-- [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/)
+- [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/): `npm install -g wrangler`
 
-### 1. Clone and install
+### Steps
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/cloudflare-memory-mcp.git
+# 1. Clone and install
+git clone https://github.com/bill97385/cloudflare-memory-mcp.git
 cd cloudflare-memory-mcp
 npm install
-```
 
-### 2. Authenticate with Cloudflare
-
-```bash
+# 2. Login to Cloudflare
 wrangler login
-```
 
-### 3. Create cloud resources
-
-```bash
-# Create D1 database
+# 3. Create D1 database
 wrangler d1 create memory-mcp
+# Copy the database_id from the output
 
-# Copy the database_id from the output and update wrangler.toml
-
-# Create Vectorize index (768 dimensions for bge-base-en-v1.5)
+# 4. Create Vectorize index
 wrangler vectorize create memory-vectors --dimensions 768 --metric cosine
-```
 
-### 4. Update wrangler.toml
+# 5. Update wrangler.toml with your database_id
+# Replace DATABASE_ID_PLACEHOLDER with the actual ID
 
-Replace `DATABASE_ID_PLACEHOLDER` with your actual D1 database ID.
-
-### 5. Run database migration
-
-```bash
+# 6. Run migration
 npm run db:migrate
-```
 
-### 6. Deploy
-
-```bash
+# 7. Deploy
 npm run deploy
-```
 
-### 7. Set API token
-
-```bash
-# Generate a secure token
+# 8. Set API token
 export TOKEN=$(openssl rand -hex 32)
 echo "Your token: $TOKEN"
+echo "$TOKEN" | wrangler secret put API_TOKEN
 
-# Set it as a Worker secret
-wrangler secret put API_TOKEN
-# Paste your token when prompted
-```
-
-### 8. Connect Claude Code
-
-**Quick install (one-liner — works on any computer):**
-
-```bash
-curl -sL https://raw.githubusercontent.com/bill97385/cloudflare-memory-mcp/main/install.sh | bash
-```
-
-Or manually:
-
-```bash
+# 9. Connect Claude Code
 claude mcp add --scope user --transport http memory-mcp \
   https://memory-mcp-server.YOUR_SUBDOMAIN.workers.dev/mcp \
-  --header "Authorization:Bearer YOUR_TOKEN"
+  --header "Authorization:Bearer $TOKEN"
 ```
-
-Replace `YOUR_SUBDOMAIN` with your Cloudflare Workers subdomain and `YOUR_TOKEN` with the token from step 7.
-
-## Usage
-
-Once connected, Claude Code will automatically have access to the memory tools. Examples:
-
-- **"Remember that I prefer TypeScript over JavaScript"** → `memory_store`
-- **"What do you know about my preferences?"** → `memory_search`
-- **"List all project memories"** → `memory_list`
 
 ## Local Development
 
 ```bash
-# Create a .dev.vars file with your token
 echo 'API_TOKEN=dev-token' > .dev.vars
-
-# Run locally
 npm run dev
 ```
 
 ## Cost
 
-All Cloudflare services used have generous free tiers:
+Runs entirely on Cloudflare's free tier:
 
 | Service | Free Tier |
 |---------|-----------|
@@ -147,8 +185,16 @@ All Cloudflare services used have generous free tiers:
 | D1 | 5M reads/day, 500MB storage |
 | Vectorize | 30M queried vectors/month |
 | Workers AI | 10K neurons/day |
+| Durable Objects | 100K requests/day |
 
-For personal use, this should be entirely free.
+For personal use, this should cost nothing.
+
+## Credits
+
+- Memory architecture inspired by [MemPalace](https://github.com/milla-jovovich/mempalace) by milla-jovovich — the highest-scoring open-source AI memory system (96.6% R@5 on LongMemEval)
+- Memory categories (`user`, `project`, `feedback`, `reference`, `general`) adapted from MemPalace's structured palace metaphor (wings, rooms, halls)
+- Built with [Cloudflare Workers](https://workers.cloudflare.com/), [D1](https://developers.cloudflare.com/d1/), [Vectorize](https://developers.cloudflare.com/vectorize/), and [Workers AI](https://developers.cloudflare.com/workers-ai/)
+- Implements the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) by Anthropic
 
 ## License
 

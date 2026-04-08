@@ -1,31 +1,30 @@
 #!/bin/bash
-# Installer for cloudflare-memory-mcp
-# Usage: curl -sL https://raw.githubusercontent.com/bill97385/cloudflare-memory-mcp/main/install.sh | bash
-
+# Add an existing cloudflare-memory-mcp server to Claude Code on this computer.
+# Usage: bash install.sh
 set -e
 
-SERVER_URL="https://memory-mcp-server.bill97385.workers.dev/mcp"
-
-# Check if claude CLI exists
 if ! command -v claude &> /dev/null; then
   echo "Error: claude CLI not found. Install Claude Code first."
   exit 1
 fi
 
-echo "Memory MCP Server Installer"
-echo "==========================="
+echo "Memory MCP — Connect to existing server"
+echo "========================================="
 echo ""
-read -rp "Enter your API Token: " TOKEN
+read -rp "Worker URL (e.g. https://memory-mcp-server.xxx.workers.dev): " SERVER_URL
+read -rp "API Token: " TOKEN
 
-if [ -z "$TOKEN" ]; then
-  echo "Error: Token cannot be empty."
+if [ -z "$SERVER_URL" ] || [ -z "$TOKEN" ]; then
+  echo "Error: Both URL and token are required."
   exit 1
 fi
 
-# Add MCP server
+# Strip trailing slash
+SERVER_URL="${SERVER_URL%/}"
+
 claude mcp add --scope user --transport http memory-mcp \
-  "$SERVER_URL" \
-  --header "Authorization:Bearer $TOKEN"
+  "${SERVER_URL}/mcp" \
+  --header "Authorization:Bearer ${TOKEN}"
 
 echo ""
 echo "Done! Restart Claude Code to activate."
