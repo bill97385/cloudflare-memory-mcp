@@ -825,7 +825,73 @@ export default {
       return handleRegister(request);
     }
 
-    // --- Protected endpoints (require auth) ---
+    // --- Secret-path SSE endpoint (for claude.ai web, authless) ---
+    // Path: /s/<API_TOKEN>/sse and /s/<API_TOKEN>/message
+    // Security: the long random token in the URL acts as authentication
+
+    const secretMatch = path.match(/^\/s\/([^/]+)(\/.*)?$/);
+    if (secretMatch) {
+      const pathToken = secretMatch[1];
+      const subPath = secretMatch[2] || "/";
+
+      if (pathToken !== env.API_TOKEN) {
+        return new Response("Not Found", { status: 404, headers: corsHeaders() });
+      }
+
+      if (subPath === "/sse" && request.method === "GET") {
+        const encoder = new TextEncoder();
+        const messageUrl = `${url.origin}/s/${pathToken}/message`;
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(`event: endpoint\ndata: ${messageUrl}\n\n`),
+            );
+          },
+        });
+        return new Response(stream, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            ...corsHeaders(),
+          },
+        });
+      }
+
+      if (subPath === "/message" && request.method === "POST") {
+        const body = await request.json();
+        if (Array.isArray(body)) {
+          const responses = await Promise.all(
+            body.map((r: JsonRpcRequest) => processRequest(r, env)),
+          );
+          return Response.json(responses.filter(Boolean), { headers: corsHeaders() });
+        }
+        const response = await processRequest(body as JsonRpcRequest, env);
+        if (!response) {
+          return new Response(null, { status: 204, headers: corsHeaders() });
+        }
+        return Response.json(response, { headers: corsHeaders() });
+      }
+
+      // Streamable HTTP on secret path
+      if ((subPath === "/mcp" || subPath === "/") && request.method === "POST") {
+        const body = await request.json();
+        if (Array.isArray(body)) {
+          const responses = await Promise.all(
+            body.map((r: JsonRpcRequest) => processRequest(r, env)),
+          );
+          return Response.json(responses.filter(Boolean), { headers: corsHeaders() });
+        }
+        const response = await processRequest(body as JsonRpcRequest, env);
+        if (!response) {
+          return new Response(null, { status: 204, headers: corsHeaders() });
+        }
+        return Response.json(response, { headers: corsHeaders() });
+      }
+
+      return new Response("Not Found", { status: 404, headers: corsHeaders() });
+    }
+
+    // --- Protected endpoints (require Bearer auth) ---
 
     if (!(await authenticate(request, env))) {
       return new Response("Unauthorized", {
@@ -837,7 +903,7 @@ export default {
       });
     }
 
-    // SSE transport: endpoint discovery
+    // SSE transport
     if (path === "/sse" && request.method === "GET") {
       const encoder = new TextEncoder();
       const baseUrl = url.origin;
